@@ -26,6 +26,12 @@
   
   "description_embedding": null,
   "testability_tier": "string",
+
+  "is_available": true,
+  "availability_status": "string",
+  "is_ai_agent": true,
+  "agent_classification": "string",
+  "classification_rationale": "string",
   
   "documentation": {
     "readme": "string",

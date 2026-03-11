@@ -1,0 +1,7 @@
+__pycache__
+.claude
+.DStore
+.env
+.env.local
+venv
+.venv

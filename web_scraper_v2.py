@@ -32,6 +32,9 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 import hashlib
 from urllib.parse import urljoin, urlparse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 class MCPRegistryScraper:
@@ -262,6 +265,13 @@ class MCPRegistryScraper:
             # Computed
             'description_embedding': None,
             'testability_tier': 'n/a',
+
+            # Availability & classification (populated by later pipeline steps)
+            'is_available': None,
+            'availability_status': 'unknown',
+            'is_ai_agent': None,
+            'agent_classification': 'unknown',
+            'classification_rationale': '',
             
             # Raw data
             # '_raw_mcp_data': mcp_agent
@@ -440,89 +450,132 @@ class MCPRegistryScraper:
         
         return docs
     
-    def scrape_all_agents(self, limit: Optional[int] = None) -> List[Dict]:
+    def _process_single_agent(self, agent_data: Dict) -> Optional[Dict]:
         """
-        Main method: Scrape all agents from registry.
-        
+        Process a single agent: convert schema, fetch docs, extract pricing.
+
+        Returns the unified agent dict, or None if it should be skipped.
+        """
+        agent_summary = agent_data.get('server')
+        agent_name = agent_summary.get('name', 'Unknown')
+
+        # Convert to unified schema
+        unified_agent = self.convert_to_unified_schema(agent_data)
+
+        # Fetch documentation
+        docs = self.fetch_documentation(unified_agent)
+        unified_agent['documentation'] = docs
+
+        # Extract pricing
+        extracted_pricing = self.pricing_extractor.extract_pricing(
+            source_url=unified_agent.get('source_url', ''),
+            readme_text=docs.get('readme'),
+            detail_page_text=docs.get('detail_page'),
+            description=unified_agent.get('description'),
+        )
+
+        if extracted_pricing != "unknown":
+            unified_agent['pricing'] = extracted_pricing
+
+        return unified_agent
+
+    def scrape_all_agents(self, limit: Optional[int] = None, max_workers: int = 10) -> List[Dict]:
+        """
+        Main method: Scrape all agents from registry with parallel processing.
+
+        Deduplicates by URL and skips dead (404) links before any heavy work.
+        Uses ThreadPoolExecutor for concurrent doc fetching and pricing.
+
         Args:
-            limit: Maximum number of agents to fetch
-            
+            limit:       Maximum number of agents to fetch.
+            max_workers: Number of concurrent threads for processing.
+
         Returns:
-            List of agents in unified schema format
+            List of agents in unified schema format.
         """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         print("🔍 Fetching agent list from MCP registry...")
         agent_list = self.fetch_agent_list(max_results=limit)
-        
+
         if not agent_list:
             print("❌ No agents found. The registry might be unavailable or using a different structure.")
             return []
-        
-        print(f"📊 Found {len(agent_list)} agents to process")
-        
-        unified_agents = []
-        seen_urls = []
 
-        for i, agent_summary in enumerate(agent_list, 1):
+        print(f"📊 Found {len(agent_list)} raw entries to process")
 
-            agent = agent_summary
-            agent_summary = agent_summary.get('server')
-            agent_name = agent_summary.get('name', 'Unknown')
-            print(f"\n[{i}/{len(agent_list)}] Processing: {agent_name}")
-            
-            # Fetch detailed information if identifier available
-            agent_id = agent_summary.get('id') or agent_summary.get('name')
-            if agent_id:
-                print(f"  📡 Fetching detailed info...")
-                detailed_agent = self.fetch_agent_details(agent_id)
-                if detailed_agent:
-                    agent_summary.update(detailed_agent)
+        # ------------------------------------------------------------------
+        # Phase 1: Fast dedup + 404 check (serial, lightweight)
+        # ------------------------------------------------------------------
+        seen_urls: set = set()
+        candidates = []   # (agent_data, url) tuples that survived dedup
+        skipped_dupes = 0
+        skipped_404 = 0
 
+        for agent_data in agent_list:
+            server = agent_data.get('server', {})
             url = (
-                agent_summary.get('repository', {}).get('url') or 
-                agent_summary.get('websiteUrl') or
-                agent_summary.get('remotes', [{}])[0].get('url') or 
-                ''
+                server.get('repository', {}).get('url')
+                or server.get('websiteUrl')
+                or (server.get('remotes') or [{}])[0].get('url')
+                or ''
             )
-            
+
+            # Dedup
             if url and url in seen_urls:
-                print(f"  ⏭️  Skipping duplicate agent (same URL): {url}")
+                skipped_dupes += 1
                 continue
-
             if url:
-                seen_urls.append(url)
+                seen_urls.add(url)
 
-            # Convert to unified schema
-            unified_agent = self.convert_to_unified_schema(agent)
-            
-            # Fetch documentation
-            print(f"  📄 Fetching documentation...")
-            docs = self.fetch_documentation(unified_agent)
-            # if docs:
-            #     print(docs)
-            unified_agent['documentation'] = docs
-            
-            # Extract pricing from source_url + documentation
-            print(f"  💰 Extracting pricing...")
-            extracted_pricing = self.pricing_extractor.extract_pricing(
-                source_url=unified_agent.get('source_url', ''),
-                readme_text=docs.get('readme'),
-                detail_page_text=docs.get('detail_page'),
-                description=unified_agent.get('description')
-            )
-            
-            # Update pricing if extraction was successful
-            if extracted_pricing != "unknown":
-                unified_agent['pricing'] = extracted_pricing
-                print(f"    ✓ Detected pricing: {extracted_pricing}")
-            else:
-                # Keep the pricing from API if extraction failed
-                print(f"    ℹ  Using API pricing: {unified_agent.get('pricing', 'unknown')}")
-            
-            unified_agents.append(unified_agent)
-            
-            # Rate limiting - be respectful
-            # time.sleep(1)
-        
+            # Quick 404 check
+            if url:
+                try:
+                    head = self.session.head(url, timeout=5, allow_redirects=True)
+                    if head.status_code == 404:
+                        skipped_404 += 1
+                        print(f"  ✗ 404: {url}")
+                        continue
+                except Exception:
+                    pass  # non-404 errors are fine — agent still gets processed
+
+            candidates.append(agent_data)
+
+        print(f"  ⏭️  Skipped {skipped_dupes} duplicates, {skipped_404} dead URLs (404)")
+        print(f"  ✅ {len(candidates)} unique agents to process\n")
+
+        # ------------------------------------------------------------------
+        # Phase 2: Parallel processing (doc fetching + pricing)
+        # ------------------------------------------------------------------
+        unified_agents: List[Dict] = []
+        lock = threading.Lock()
+        counter = [0]   # mutable counter for progress
+
+        def _worker(agent_data):
+            result = self._process_single_agent(agent_data)
+            with lock:
+                counter[0] += 1
+                idx = counter[0]
+            if result:
+                name = result.get('name', '?')
+                pricing = result.get('pricing', 'unknown')
+                has_readme = bool(result.get('documentation', {}).get('readme'))
+                doc_src = "README" if has_readme else "detail_page" if result.get('documentation', {}).get('detail_page') else "none"
+                print(f"  [{idx}/{len(candidates)}] {name}  (pricing={pricing}, docs={doc_src})")
+            return result
+
+        print(f"  Processing {len(candidates)} agents (max_workers={max_workers})...")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_worker, a): a for a in candidates}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    # Mark as available since it passed the 404 check
+                    result['is_available'] = True
+                    result['availability_status'] = 'reachable'
+                    unified_agents.append(result)
+
         print(f"\n✅ Successfully scraped {len(unified_agents)} agents")
         return unified_agents
     
@@ -931,6 +984,107 @@ class PricingExtractor:
             print(f"    ✗ PyPI check failed: {e}")
         
         return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# AvailabilityChecker — concurrent HTTP probes to verify server reachability
+# ---------------------------------------------------------------------------
+
+class AvailabilityChecker:
+    """
+    Checks whether MCP server URLs are reachable via HTTP.
+
+    For each agent, sends a HEAD request (with GET fallback) to the source_url
+    and tags the agent with ``is_available`` and ``availability_status``.
+
+    Uses ``concurrent.futures.ThreadPoolExecutor`` for parallel checks.
+    """
+
+    def __init__(
+        self,
+        timeout: int = 8,
+        max_workers: int = 20,
+    ):
+        self.timeout = timeout
+        self.max_workers = max_workers
+
+    # ------------------------------------------------------------------
+    # URL classification
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _classify_url(source_url: str) -> str:
+        """Classify a source_url as 'http_endpoint', 'github_repo', or 'no_url'."""
+        if not source_url or not source_url.startswith('http'):
+            return 'no_url'
+        parsed = urlparse(source_url)
+        if 'github.com' in parsed.netloc:
+            return 'github_repo'
+        return 'http_endpoint'
+
+    # ------------------------------------------------------------------
+    # Single-agent check
+    # ------------------------------------------------------------------
+
+    def _check_single(self, agent: Dict) -> Dict:
+        """
+        Probe a single agent's source_url and return availability info.
+
+        Returns dict with keys ``is_available`` (bool | None) and
+        ``availability_status`` ('reachable' | 'unreachable' | 'unknown').
+        """
+        url = agent.get('source_url', '')
+        url_type = self._classify_url(url)
+
+        if url_type == 'no_url':
+            return {'is_available': None, 'availability_status': 'unknown'}
+
+        try:
+            resp = requests.head(url, timeout=self.timeout, allow_redirects=True)
+            # Some servers reject HEAD — fall back to a streaming GET
+            if resp.status_code in (405, 501):
+                resp = requests.get(url, timeout=self.timeout, stream=True)
+                resp.close()
+            reachable = resp.status_code < 400
+            return {
+                'is_available': reachable,
+                'availability_status': 'reachable' if reachable else 'unreachable',
+            }
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            return {'is_available': False, 'availability_status': 'unreachable'}
+        except Exception:
+            return {'is_available': None, 'availability_status': 'unknown'}
+
+    # ------------------------------------------------------------------
+    # Batch (concurrent) check
+    # ------------------------------------------------------------------
+
+    def check_all(self, agents: List[Dict]) -> List[Dict]:
+        """
+        Run availability checks concurrently over *agents*.
+
+        Mutates each agent dict in-place (adds ``is_available`` and
+        ``availability_status``) and returns the same list.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print(f"  Checking availability of {len(agents)} agents "
+              f"(max_workers={self.max_workers})...")
+
+        def _task(agent):
+            result = self._check_single(agent)
+            agent['is_available'] = result['is_available']
+            agent['availability_status'] = result['availability_status']
+            return agent['name'], result['availability_status']
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(_task, a): a for a in agents}
+            for i, future in enumerate(as_completed(futures), 1):
+                name, status = future.result()
+                print(f"    [{i}/{len(agents)}] {name}: {status}")
+
+        return agents
+
 
 # ---------------------------------------------------------------------------
 # Helper: fetch text from the MCP registry's own detail page when there is
@@ -1427,6 +1581,140 @@ JSON structure:
             "text_source":        source_label,
         }
 
+    # ------------------------------------------------------------------
+    # Agent-type classification (AI agent vs API wrapper)
+    # ------------------------------------------------------------------
+
+    def classify_agent_type(self, agent: Dict) -> Dict:
+        """
+        Classify whether this MCP server is an AI agent or a plain API wrapper.
+
+        Returns dict with keys:
+            is_ai_agent              – bool | None
+            agent_classification     – "ai_agent" | "api_wrapper" | "unknown"
+            classification_rationale – str
+        """
+        text, source_label = self._choose_best_text(agent)
+
+        if not text.strip():
+            return self._empty_classification()
+
+        truncated = self._truncate(text)
+        print(f"    Classifying agent type (source: {source_label}, "
+              f"{len(truncated)} chars)...")
+
+        raw = self._call_openai(
+            system_prompt=self._build_classification_system_prompt(),
+            user_content=self._build_classification_user_prompt(
+                agent.get('name', ''), truncated, source_label,
+            ),
+        )
+
+        if raw is None:
+            return self._empty_classification()
+
+        return self._parse_classification_response(raw)
+
+    @staticmethod
+    def _build_classification_system_prompt() -> str:
+        return (
+            "You are an expert in AI systems and MCP (Model Context Protocol) servers.\n"
+            "\n"
+            "Your task is to classify whether an MCP server is a genuine AI agent or a\n"
+            "plain API wrapper.\n"
+            "\n"
+            "Definitions:\n"
+            '- "ai_agent": The server uses AI/ML models, language models, or autonomous\n'
+            "  reasoning internally to perform tasks.  It has its own intelligence layer,\n"
+            "  not just routing.  Examples: a server that autonomously writes code,\n"
+            "  summarises documents, plans tasks, or makes decisions using an embedded\n"
+            "  LLM or ML model.\n"
+            "\n"
+            '- "api_wrapper": The server is a thin adapter that exposes an existing\n'
+            "  non-AI API (database, REST service, file system, payment gateway, version\n"
+            "  control, etc.) to MCP clients.  It executes deterministic operations —\n"
+            "  read, write, query — without AI reasoning.  The *calling* LLM is the\n"
+            "  intelligence; this server is just plumbing.\n"
+            "\n"
+            "Decision heuristics:\n"
+            "  AGENT signals: mentions of LLM, AI model, embeddings, reasoning, planning,\n"
+            "    agent, autonomous, GPT, Claude, Gemini, inference, generation,\n"
+            "    summarisation, classification.\n"
+            "  WRAPPER signals: mentions of CRUD operations, API keys for third-party\n"
+            "    services, GitHub/Jira/Slack/database connectors, file reading/writing,\n"
+            "    search indexing (without ML), sending messages/emails/notifications with\n"
+            "    no AI step.\n"
+            "  AMBIGUOUS: Some servers do both.  If >50% of described functionality is\n"
+            "    AI-driven, lean toward \"ai_agent\"; otherwise \"api_wrapper\".\n"
+            "\n"
+            "Return ONLY valid JSON — no markdown fences, no commentary.\n"
+            "\n"
+            "JSON structure:\n"
+            "{\n"
+            '  "agent_classification": "ai_agent" | "api_wrapper" | "unknown",\n'
+            '  "is_ai_agent": true | false | null,\n'
+            '  "classification_rationale": "One or two sentences explaining the decision."\n'
+            "}"
+        )
+
+    @staticmethod
+    def _build_classification_user_prompt(
+        name: str, text: str, source_label: str,
+    ) -> str:
+        source_desc = {
+            "readme":           "README file",
+            "detail_page":      "registry detail page",
+            "description_only": "API description field",
+        }.get(source_label, "documentation")
+
+        return (
+            f"Server name: {name}\n"
+            f"Documentation source: {source_desc}\n\n"
+            f"--- BEGIN DOCUMENTATION ---\n"
+            f"{text}\n"
+            f"--- END DOCUMENTATION ---\n\n"
+            f"Classify this MCP server and return the JSON now."
+        )
+
+    def _parse_classification_response(self, raw: str) -> Dict:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            cleaned = re.sub(r'```(?:json)?|```', '', raw).strip()
+            try:
+                data = json.loads(cleaned)
+            except json.JSONDecodeError:
+                print(f"    ✗ Could not parse classification response: {raw[:200]}")
+                return self._empty_classification()
+
+        classification = str(data.get('agent_classification', 'unknown')).lower()
+        if classification not in ('ai_agent', 'api_wrapper', 'unknown'):
+            classification = 'unknown'
+
+        raw_is_agent = data.get('is_ai_agent')
+        if isinstance(raw_is_agent, bool):
+            is_ai_agent = raw_is_agent
+        elif classification == 'ai_agent':
+            is_ai_agent = True
+        elif classification == 'api_wrapper':
+            is_ai_agent = False
+        else:
+            is_ai_agent = None
+
+        return {
+            'is_ai_agent':              is_ai_agent,
+            'agent_classification':     classification,
+            'classification_rationale': str(data.get('classification_rationale', '')),
+        }
+
+    @staticmethod
+    def _empty_classification() -> Dict:
+        return {
+            'is_ai_agent':              None,
+            'agent_classification':     'unknown',
+            'classification_rationale': '',
+        }
+
 
 # ---------------------------------------------------------------------------
 # DocumentationProcessor — now with real LLM-backed methods
@@ -1566,6 +1854,12 @@ class DocumentationProcessor:
             agent["documentation_quality"]   = llm_result.get("quality_score",     0.0)
             agent["quality_rationale"]       = llm_result.get("quality_rationale",  "")
             agent["llm_text_source"]         = llm_result.get("text_source",        "unknown")
+
+            # Agent-type classification (AI agent vs API wrapper)
+            cls_result = self.llm_analyser.classify_agent_type(agent)
+            agent["is_ai_agent"]              = cls_result["is_ai_agent"]
+            agent["agent_classification"]     = cls_result["agent_classification"]
+            agent["classification_rationale"] = cls_result["classification_rationale"]
         else:
             # No LLM configured — leave placeholders
             agent["llm_extracted"] = {
@@ -1576,6 +1870,9 @@ class DocumentationProcessor:
             agent["documentation_quality"] = 0.0
             agent["quality_rationale"]     = "LLM analysis not configured."
             agent["llm_text_source"]       = "none"
+            agent["is_ai_agent"]              = None
+            agent["agent_classification"]     = "unknown"
+            agent["classification_rationale"] = ""
 
         # --- Step 3: store chunks ---
         agent["documentation_chunks"] = all_chunks
@@ -1583,6 +1880,7 @@ class DocumentationProcessor:
         print(f"  📝 Created {len(all_chunks)} documentation chunks")
         print(f"  ⭐ Quality score : {agent['documentation_quality']:.2f}")
         print(f"  📖 LLM text source: {agent['llm_text_source']}")
+        print(f"  🏷️  Classification : {agent['agent_classification']}")
         if agent["llm_extracted"]["capabilities"]:
             print(f"  🎯 Capabilities  : {len(agent['llm_extracted']['capabilities'])} extracted")
 
@@ -1602,7 +1900,7 @@ def main():
 
     # Set to True to enable LLM capability extraction and quality scoring.
     # Requires OPENAI_API_KEY to be set in the environment.
-    ENABLE_LLM = False
+    ENABLE_LLM = True
 
     # Model to use. 
     LLM_MODEL  = "gpt-4.1-mini"
@@ -1658,7 +1956,7 @@ def main():
         if llm_analyser and i < len(agents):
             time.sleep(LLM_DELAY)
 
-    # Step 4: Save results
+    # Step 3: Save results
     print("\n" + "="*70)
     print("STEP 3: SAVING RESULTS")
     print("="*70)
@@ -1672,11 +1970,26 @@ def main():
     total = len(processed_agents)
     avg_quality = sum(a.get("documentation_quality", 0) for a in processed_agents) / total
     with_caps   = sum(1 for a in processed_agents if a.get("llm_extracted", {}).get("capabilities"))
+    reachable   = sum(1 for a in processed_agents if a.get('availability_status') == 'reachable')
+    unreachable = sum(1 for a in processed_agents if a.get('availability_status') == 'unreachable')
+    ai_agents   = sum(1 for a in processed_agents if a.get('agent_classification') == 'ai_agent')
+    api_wrappers = sum(1 for a in processed_agents if a.get('agent_classification') == 'api_wrapper')
     print(f"✅ Total agents processed : {total}")
     print(f"✅ Total doc chunks       : {sum(len(a.get('documentation_chunks', [])) for a in processed_agents)}")
     print(f"✅ Avg quality score      : {avg_quality:.2f}")
     print(f"✅ Agents with LLM caps   : {with_caps}/{total}")
+    print(f"✅ Reachable agents       : {reachable}/{total}")
+    print(f"✅ Unreachable agents     : {unreachable}/{total}")
+    print(f"✅ AI agents classified   : {ai_agents}/{total}")
+    print(f"✅ API wrappers classified: {api_wrappers}/{total}")
     print(f"\n📁 Output file: {output_file}")
+
+    # Save filtered subset: reachable AI agents only
+    reachable_ai = [a for a in processed_agents
+                    if a.get('is_available') and a.get('agent_classification') == 'ai_agent']
+    if reachable_ai:
+        ai_file = scraper.save_to_file(reachable_ai, "mcp_ai_agents.json")
+        print(f"📁 Reachable AI agents: {len(reachable_ai)} → {ai_file}")
 
     # Show sample
     print("\n" + "="*70)
@@ -1693,6 +2006,8 @@ def main():
         print(f"   Doc chunks      : {len(sample.get('documentation_chunks', []))}")
         print(f"   Quality score   : {sample.get('documentation_quality', 0):.2f}")
         print(f"   LLM text source : {sample.get('llm_text_source', 'n/a')}")
+        print(f"   Available       : {sample.get('availability_status', 'unknown')}")
+        print(f"   Classification  : {sample.get('agent_classification', 'unknown')}")
         llm = sample.get("llm_extracted", {})
         if llm.get("capabilities"):
             print(f"   Capabilities ({len(llm['capabilities'])}):")

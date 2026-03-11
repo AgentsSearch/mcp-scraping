@@ -26,6 +26,12 @@
   
   "description_embedding": null,            // Vector embedding (array of floats or null)
   "testability_tier": "string",             // "EASY", "MEDIUM", "HARD", "n/a"
+
+  "is_available": true,                     // bool or null — whether the server URL responded with HTTP < 400
+  "availability_status": "string",          // "reachable", "unreachable", "unknown"
+  "is_ai_agent": true,                      // bool or null — LLM-determined: true=AI agent, false=API wrapper
+  "agent_classification": "string",         // "ai_agent", "api_wrapper", "unknown"
+  "classification_rationale": "string",     // LLM explanation for the classification decision
   
   "documentation": {                        // Documentation sources
     "readme": "string",                     // README text (if available)
