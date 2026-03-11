@@ -1,4 +1,4 @@
-# Agent Search Engine
+# mcp-scraping - Agent Search Engine
 
 A data pipeline that scrapes AI agent (MCP server) metadata from the official [Model Context Protocol registry](https://registry.modelcontextprotocol.io), enriches it with pricing detection, documentation fetching, and optional LLM-powered analysis, then outputs a structured JSON dataset.
 
