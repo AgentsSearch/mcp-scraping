@@ -26,6 +26,7 @@ Set the environment variable OPENAI_API_KEY before running:
 import os
 import re
 import time
+import argparse
 import requests
 import json
 from typing import List, Dict, Optional, Tuple
@@ -273,6 +274,9 @@ class MCPRegistryScraper:
             'agent_classification': 'unknown',
             'classification_rationale': '',
             
+            # Remote endpoints (live MCP server URLs)
+            'remotes': mcp_agent.get('remotes', []),
+
             # Raw data
             # '_raw_mcp_data': mcp_agent
         }
@@ -515,30 +519,56 @@ class MCPRegistryScraper:
 
         for agent_data in agent_list:
             server = agent_data.get('server', {})
-            url = (
+
+            # Primary dedup key: source_url (repo or website)
+            source_url = (
                 server.get('repository', {}).get('url')
                 or server.get('websiteUrl')
-                or (server.get('remotes') or [{}])[0].get('url')
                 or ''
             )
+            remote_urls = [r.get('url', '') for r in server.get('remotes', []) if r.get('url')]
 
-            # Dedup
-            if url and url in seen_urls:
+            dedup_key = source_url or (remote_urls[0] if remote_urls else '')
+            if dedup_key and dedup_key in seen_urls:
                 skipped_dupes += 1
                 continue
-            if url:
-                seen_urls.add(url)
+            if dedup_key:
+                seen_urls.add(dedup_key)
 
-            # Quick 404 check
-            if url:
+            # Quick 404 check: try remotes first, fall back to source_url
+            if remote_urls:
+                any_alive = False
+                for rurl in remote_urls:
+                    try:
+                        head = self.session.head(rurl, timeout=5, allow_redirects=True)
+                        if head.status_code != 404:
+                            any_alive = True
+                    except Exception:
+                        any_alive = True  # non-404 errors are fine
+                if not any_alive:
+                    # All remotes returned 404 — fall back to source_url
+                    if source_url:
+                        try:
+                            head = self.session.head(source_url, timeout=5, allow_redirects=True)
+                            if head.status_code == 404:
+                                skipped_404 += 1
+                                print(f"  ✗ 404 (all remotes + source): {dedup_key}")
+                                continue
+                        except Exception:
+                            pass
+                    else:
+                        skipped_404 += 1
+                        print(f"  ✗ 404 (all remotes, no source): {dedup_key}")
+                        continue
+            elif source_url:
                 try:
-                    head = self.session.head(url, timeout=5, allow_redirects=True)
+                    head = self.session.head(source_url, timeout=5, allow_redirects=True)
                     if head.status_code == 404:
                         skipped_404 += 1
-                        print(f"  ✗ 404: {url}")
+                        print(f"  ✗ 404: {source_url}")
                         continue
                 except Exception:
-                    pass  # non-404 errors are fine — agent still gets processed
+                    pass
 
             candidates.append(agent_data)
 
@@ -1026,34 +1056,65 @@ class AvailabilityChecker:
     # Single-agent check
     # ------------------------------------------------------------------
 
-    def _check_single(self, agent: Dict) -> Dict:
+    def _probe_url(self, url: str) -> Optional[bool]:
         """
-        Probe a single agent's source_url and return availability info.
-
-        Returns dict with keys ``is_available`` (bool | None) and
-        ``availability_status`` ('reachable' | 'unreachable' | 'unknown').
+        Probe a single URL. Returns True (reachable), False (unreachable),
+        or None (unknown/error).
         """
-        url = agent.get('source_url', '')
-        url_type = self._classify_url(url)
-
-        if url_type == 'no_url':
-            return {'is_available': None, 'availability_status': 'unknown'}
-
         try:
             resp = requests.head(url, timeout=self.timeout, allow_redirects=True)
             # Some servers reject HEAD — fall back to a streaming GET
             if resp.status_code in (405, 501):
                 resp = requests.get(url, timeout=self.timeout, stream=True)
                 resp.close()
-            reachable = resp.status_code < 400
-            return {
-                'is_available': reachable,
-                'availability_status': 'reachable' if reachable else 'unreachable',
-            }
+            return resp.status_code < 400
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-            return {'is_available': False, 'availability_status': 'unreachable'}
+            return False
         except Exception:
+            return None
+
+    def _check_single(self, agent: Dict) -> Dict:
+        """
+        Probe a single agent and return availability info.
+
+        For agents with remotes: tests each remote URL, keeps only working
+        ones in ``agent['remotes']``. If none work, falls back to source_url.
+
+        Returns dict with keys ``is_available`` (bool | None) and
+        ``availability_status`` ('reachable' | 'unreachable' | 'unknown').
+        """
+        remotes = agent.get('remotes', [])
+        source_url = agent.get('source_url', '')
+
+        # --- Try remotes first ---
+        if remotes:
+            working_remotes = []
+            for remote in remotes:
+                rurl = remote.get('url', '')
+                if not rurl:
+                    continue
+                result = self._probe_url(rurl)
+                if result is True or result is None:
+                    # Keep reachable or ambiguous remotes (only drop confirmed dead)
+                    working_remotes.append(remote)
+
+            if working_remotes:
+                agent['remotes'] = working_remotes
+                return {'is_available': True, 'availability_status': 'reachable'}
+
+            # All remotes failed — clear them and fall back to source_url
+            agent['remotes'] = []
+
+        # --- Fall back to source_url ---
+        if not source_url or not source_url.startswith('http'):
             return {'is_available': None, 'availability_status': 'unknown'}
+
+        result = self._probe_url(source_url)
+        if result is True:
+            return {'is_available': True, 'availability_status': 'reachable'}
+        elif result is False:
+            return {'is_available': False, 'availability_status': 'unreachable'}
+        return {'is_available': None, 'availability_status': 'unknown'}
 
     # ------------------------------------------------------------------
     # Batch (concurrent) check
@@ -1082,6 +1143,202 @@ class AvailabilityChecker:
             for i, future in enumerate(as_completed(futures), 1):
                 name, status = future.result()
                 print(f"    [{i}/{len(agents)}] {name}: {status}")
+
+        return agents
+
+
+# ---------------------------------------------------------------------------
+# MCP Protocol Prober — fetches tool definitions via initialize + tools/list
+# ---------------------------------------------------------------------------
+
+class MCPProber:
+    """
+    Probes MCP servers via streamable-http transport to retrieve actual tool
+    definitions using the MCP protocol (initialize → tools/list).
+
+    Populates ``agent['tools']`` with ground-truth data and sets
+    ``agent['probe_status']`` to 'success', 'failed', or 'skipped'.
+    """
+
+    def __init__(self, timeout: int = 15, max_workers: int = 10):
+        self.timeout = timeout
+        self.max_workers = max_workers
+        self.protocol_version = "2024-11-05"
+        self.client_info = {"name": "agent-search-engine", "version": "0.1"}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_sse_response(text: str) -> Optional[Dict]:
+        """Parse an SSE-formatted response or plain JSON into a result dict."""
+        # Try SSE format first (event: message\ndata: {...})
+        for line in text.split('\n'):
+            line = line.strip()
+            if line.startswith('data: '):
+                try:
+                    payload = json.loads(line[6:])
+                    if 'result' in payload:
+                        return payload['result']
+                except json.JSONDecodeError:
+                    continue
+        # Fallback: plain JSON
+        try:
+            payload = json.loads(text)
+            if 'result' in payload:
+                return payload['result']
+        except json.JSONDecodeError:
+            pass
+        return None
+
+    @staticmethod
+    def _build_headers(remote: Dict) -> Dict:
+        """Build HTTP headers for an MCP request, including auth if available."""
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+        }
+        for h in remote.get('headers', []):
+            name = h.get('name', '')
+            value = h.get('value', '')
+            if name and value:
+                headers[name] = value
+        return headers
+
+    def _should_probe(self, agent: Dict) -> bool:
+        """Return True if agent has at least one remote we can probe."""
+        remotes = agent.get('remotes', [])
+        if not remotes:
+            return False
+        for remote in remotes:
+            if not remote.get('url'):
+                continue
+            # Skip remotes that require auth headers we don't have
+            needs_auth = False
+            for h in remote.get('headers', []):
+                if h.get('isRequired') and not h.get('value'):
+                    needs_auth = True
+                    break
+            if not needs_auth:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Single probe
+    # ------------------------------------------------------------------
+
+    def _probe_single(self, remote_url: str, headers: Dict) -> Optional[List[Dict]]:
+        """
+        Send MCP initialize + tools/list to a single remote URL.
+
+        Returns list of tool dicts on success, None on failure.
+        """
+        session = requests.Session()
+        session.headers.update(headers)
+
+        # Step 1: initialize
+        init_payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": self.protocol_version,
+                "capabilities": {},
+                "clientInfo": self.client_info,
+            }
+        }
+        try:
+            resp = session.post(remote_url, json=init_payload, timeout=self.timeout)
+            if resp.status_code not in (200, 201):
+                return None
+            init_result = self._parse_sse_response(resp.text)
+            if not init_result:
+                return None
+
+            # Carry session ID if provided
+            mcp_session_id = resp.headers.get('Mcp-Session-Id')
+            if mcp_session_id:
+                session.headers['Mcp-Session-Id'] = mcp_session_id
+        except (requests.exceptions.RequestException, json.JSONDecodeError):
+            return None
+
+        # Step 2: tools/list
+        tools_payload = {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }
+        try:
+            resp = session.post(remote_url, json=tools_payload, timeout=self.timeout)
+            if resp.status_code not in (200, 201):
+                return None
+            tools_result = self._parse_sse_response(resp.text)
+            if not tools_result:
+                return None
+            return tools_result.get('tools', [])
+        except (requests.exceptions.RequestException, json.JSONDecodeError):
+            return None
+
+    # ------------------------------------------------------------------
+    # Agent-level probe (tries each remote)
+    # ------------------------------------------------------------------
+
+    def _probe_agent(self, agent: Dict) -> None:
+        """Probe an agent's remotes in order. Mutates agent in-place."""
+        remotes = agent.get('remotes', [])
+
+        for remote in remotes:
+            url = remote.get('url', '')
+            if not url:
+                continue
+            # Skip remotes requiring auth we don't have
+            needs_auth = False
+            for h in remote.get('headers', []):
+                if h.get('isRequired') and not h.get('value'):
+                    needs_auth = True
+                    break
+            if needs_auth:
+                continue
+
+            headers = self._build_headers(remote)
+            tools = self._probe_single(url, headers)
+            if tools is not None:
+                agent['tools'] = tools
+                agent['probe_status'] = 'success'
+                agent['probed_tool_count'] = len(tools)
+                return
+
+        agent['probe_status'] = 'failed'
+        agent['probed_tool_count'] = 0
+
+    # ------------------------------------------------------------------
+    # Batch probe
+    # ------------------------------------------------------------------
+
+    def probe_all(self, agents: List[Dict]) -> List[Dict]:
+        """
+        Probe all agents with accessible remotes concurrently.
+
+        Mutates each agent dict in-place and returns the same list.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        probeable = [a for a in agents if self._should_probe(a)]
+
+        # Mark non-probeable agents
+        for a in agents:
+            if not self._should_probe(a):
+                a['probe_status'] = 'skipped'
+                a['probed_tool_count'] = 0
+
+        print(f"  Probing {len(probeable)}/{len(agents)} agents with accessible remotes "
+              f"(max_workers={self.max_workers})...")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self._probe_agent, a): a for a in probeable}
+            for i, future in enumerate(as_completed(futures), 1):
+                agent = futures[future]
+                future.result()  # raises if exception
+                status = agent.get('probe_status', 'unknown')
+                tool_count = agent.get('probed_tool_count', 0)
+                print(f"    [{i}/{len(probeable)}] {agent['name']}: {status} ({tool_count} tools)")
 
         return agents
 
@@ -1810,7 +2067,7 @@ class DocumentationProcessor:
         """
         return 0.0
 
-    def process_agent_documentation(self, agent: Dict) -> Dict:
+    def process_agent_documentation(self, agent: Dict, skip_llm: bool = False) -> Dict:
         """
         Full documentation processing pipeline.
 
@@ -1820,8 +2077,8 @@ class DocumentationProcessor:
              requirements, and a quality score in a single API call.
           3. Store all results back onto the agent dict in-place.
 
-        If no llm_analyser is set, LLM fields are left as empty placeholders
-        and the quality score remains 0.0.
+        If no llm_analyser is set or skip_llm is True, LLM fields are left
+        as empty placeholders and the quality score remains 0.0.
         """
         docs = agent.get("documentation", {})
         all_chunks = []
@@ -1844,7 +2101,7 @@ class DocumentationProcessor:
             all_chunks.extend(detail_chunks)
 
         # --- Step 2: LLM analysis ---
-        if self.llm_analyser is not None:
+        if self.llm_analyser is not None and not skip_llm:
             llm_result = self.llm_analyser.analyse(agent)
             agent["llm_extracted"] = {
                 "capabilities": llm_result.get("capabilities", []),
@@ -1887,7 +2144,7 @@ class DocumentationProcessor:
         return agent
 
 
-def main():
+def main(probeable: bool = False):
     """Main execution function."""
     print("="*70)
     print("MCP REGISTRY WEB SCRAPER")
@@ -1921,6 +2178,17 @@ def main():
         print("\n❌ No agents were scraped. Exiting.")
         return
 
+    # Step 1.5: Probe MCP servers for tool definitions
+    print("\n" + "="*70)
+    print("STEP 1.5: PROBING MCP SERVERS FOR TOOL DEFINITIONS")
+    print("="*70)
+
+    prober = MCPProber(timeout=15, max_workers=10)
+    agents = prober.probe_all(agents)
+
+    probed_ok = sum(1 for a in agents if a.get('probe_status') == 'success')
+    print(f"\n  ✅ Successfully probed: {probed_ok}/{len(agents)} agents")
+
     # Step 2: Set up optional LLM analyser
     llm_analyser = None
     if ENABLE_LLM:
@@ -1949,12 +2217,38 @@ def main():
     processed_agents = []
     for i, agent in enumerate(agents, 1):
         print(f"\n[{i}/{len(agents)}] 📦 Processing: {agent['name']}")
-        processed_agent = processor.process_agent_documentation(agent)
+
+        if agent.get('probe_status') == 'success':
+            # Tools already populated via MCP protocol — skip LLM capability extraction
+            print(f"    ⚡ Skipping LLM (probed: {agent.get('probed_tool_count', 0)} tools)")
+            processed_agent = processor.process_agent_documentation(agent, skip_llm=True)
+        else:
+            processed_agent = processor.process_agent_documentation(agent)
+
         processed_agents.append(processed_agent)
 
         # Inter-request delay to avoid hammering the LLM API
-        if llm_analyser and i < len(agents):
+        if llm_analyser and agent.get('probe_status') != 'success' and i < len(agents):
             time.sleep(LLM_DELAY)
+
+    # Optional filter: only probeable AI agents
+    if probeable:
+        print("\n" + "="*70)
+        print("FILTERING: PROBEABLE AI AGENTS ONLY")
+        print("="*70)
+        before = len(processed_agents)
+        processed_agents = [
+            a for a in processed_agents
+            if a.get('agent_classification') == 'ai_agent'
+            and a.get('remotes')
+            and a.get('pricing') in ('free', 'open_source')
+            and not any(
+                h.get('isRequired')
+                for r in a.get('remotes', [])
+                for h in r.get('headers', [])
+            )
+        ]
+        print(f"  Filtered {before} -> {len(processed_agents)} probeable agents")
 
     # Step 3: Save results
     print("\n" + "="*70)
@@ -1982,6 +2276,12 @@ def main():
     print(f"✅ Unreachable agents     : {unreachable}/{total}")
     print(f"✅ AI agents classified   : {ai_agents}/{total}")
     print(f"✅ API wrappers classified: {api_wrappers}/{total}")
+    probed     = sum(1 for a in processed_agents if a.get('probe_status') == 'success')
+    probe_fail = sum(1 for a in processed_agents if a.get('probe_status') == 'failed')
+    total_tools = sum(a.get('probed_tool_count', 0) for a in processed_agents)
+    print(f"✅ Probed successfully    : {probed}/{total}")
+    print(f"✅ Probe failed           : {probe_fail}/{total}")
+    print(f"✅ Total tools discovered : {total_tools}")
     print(f"\n📁 Output file: {output_file}")
 
     # Save filtered subset: reachable AI agents only
@@ -2025,5 +2325,16 @@ def main():
             print(f"   Rationale       : {sample['quality_rationale']}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="MCP Registry Web Scraper")
+    parser.add_argument(
+        "--probeable",
+        action="store_true",
+        help="Only output AI agents that have accessible remote endpoints and are free (open_source pricing, no required auth headers).",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(probeable=args.probeable)

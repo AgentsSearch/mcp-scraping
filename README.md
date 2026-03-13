@@ -1,14 +1,17 @@
 # mcp-scraping - Agent Search Engine
 
-A data pipeline that scrapes AI agent (MCP server) metadata from the official [Model Context Protocol registry](https://registry.modelcontextprotocol.io), enriches it with pricing detection, documentation fetching, and optional LLM-powered analysis, then outputs a structured JSON dataset.
+A data pipeline that scrapes AI agent (MCP server) metadata from the official [Model Context Protocol registry](https://registry.modelcontextprotocol.io), probes live servers for tool definitions, enriches with pricing detection and documentation, and optionally performs LLM-powered analysis. Outputs a structured JSON dataset ready for embedding and similarity search.
 
 ## What It Does
 
 1. **Scrapes** the MCP registry API with cursor-based pagination
-2. **Fetches documentation** for each agent (GitHub README → registry detail page → API description)
-3. **Detects pricing** (free / freemium / paid / open_source) via pricing pages, keyword analysis, LICENSE files, and NPM/PyPI metadata
-4. **Classifies** whether entries are true AI agents and checks availability
-5. **Optionally analyzes** documentation with an LLM to extract capabilities, limitations, requirements, and a calibrated quality score
+2. **Captures remote endpoints** (`remotes`) — live MCP server URLs with transport type and auth requirements
+3. **Probes live servers** via MCP protocol (`initialize` + `tools/list`) to get ground-truth tool definitions (name, description, input schema)
+4. **Fetches documentation** for each agent (GitHub README → registry detail page → API description)
+5. **Detects pricing** (free / freemium / paid / open_source) via pricing pages, keyword analysis, LICENSE files, and NPM/PyPI metadata
+6. **Checks availability** — tests remote endpoints first, falls back to source URL; only keeps working remotes
+7. **Classifies** whether entries are true AI agents or API wrappers
+8. **LLM analysis (fallback)** — for agents without live remotes or where probing fails, uses an LLM to extract capabilities, limitations, requirements, and a calibrated quality score. Skipped for successfully probed agents.
 
 Output is saved to `mcp_agents.json`.
 
@@ -26,9 +29,17 @@ pip install -r requirements.txt
 python3 web_scraper_v2.py
 ```
 
+### Probeable-Only Mode
+
+To output only free AI agents with accessible remote endpoints and no required auth:
+
+```bash
+python3 web_scraper_v2.py --probeable
+```
+
 ### LLM Analysis (Optional)
 
-To enable LLM-powered capability extraction and quality scoring:
+LLM enrichment is used as a fallback for agents that can't be probed via MCP protocol. To enable:
 
 ```bash
 export OPENAI_API_KEY="sk-..."
@@ -47,16 +58,43 @@ Configuration is set via constants in `main()` of `web_scraper_v2.py`:
 | `LLM_MODEL` | `"gpt-4.1-mini"` | OpenAI model for analysis |
 | `LLM_DELAY` | `0` | Seconds between LLM API calls |
 
+CLI flags:
+
+| Flag | Description |
+|---|---|
+| `--probeable` | Only output free AI agents with accessible remotes and no required auth |
+
+## Pipeline
+
+```
+Scrape registry API
+        │
+        ▼
+Probe remotes (MCP initialize + tools/list)
+        │
+        ▼
+Fetch documentation (README / detail page)
+        │
+        ▼
+LLM analysis (only for agents not successfully probed)
+        │
+        ▼
+Save to mcp_agents.json
+```
+
 ## Output Schema
 
 Each agent in `mcp_agents.json` includes:
 
 - **Identity** — `agent_id`, `name`, `source`, `source_url`
-- **Tools** — list of tools with names and descriptions
+- **Remotes** — live MCP server endpoints with transport type (`streamable-http` / `sse`), URL, and auth header requirements
+- **Tools** — from MCP `tools/list` (probed) or documentation (LLM-extracted): name, description, input schema
 - **Pricing** — detected pricing model
 - **Documentation** — raw README and detail page text, chunked into ~512-token segments
+- **Availability** — `is_available`, `availability_status`, with dead remotes filtered out
+- **Probe status** — `probe_status` (`success` / `failed` / `skipped`), `probed_tool_count`
 - **Classification** — whether it's a true AI agent, with rationale
-- **LLM Extracted** (when enabled) — `capabilities`, `limitations`, `requirements`, `documentation_quality` score (0.0–1.0)
+- **LLM Extracted** (fallback) — `capabilities`, `limitations`, `requirements`, `documentation_quality` score (0.0–1.0)
 
 Full schema definition: [`schema.json`](schema.json)
 
