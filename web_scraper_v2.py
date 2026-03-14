@@ -38,6 +38,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _get_with_retry(url, timeout=5, max_retries=2, **kwargs):
+    """Module-level GET with 429 retry and exponential backoff."""
+    resp = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, timeout=timeout, **kwargs)
+            if resp.status_code == 429:
+                wait = int(resp.headers.get('Retry-After', 2 ** attempt * 5))
+                wait = min(wait, 60)
+                print(f"    ⏳ Rate limited (429) — waiting {wait}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            return resp
+        except requests.exceptions.RequestException:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2)
+    return resp
+
+
 class MCPRegistryScraper:
     """
     Scraper for MCP (Model Context Protocol) Registry to fetch AI agent metadata.
@@ -52,7 +72,26 @@ class MCPRegistryScraper:
             'Accept': 'application/json'
         })
         self.pricing_extractor = PricingExtractor(session=self.session)
-    
+
+    def _request_with_retry(self, url, timeout=10, max_retries=3):
+        """Session GET with 429 retry and exponential backoff."""
+        resp = None
+        for attempt in range(max_retries):
+            try:
+                resp = self.session.get(url, timeout=timeout)
+                if resp.status_code == 429:
+                    wait = int(resp.headers.get('Retry-After', 2 ** attempt * 5))
+                    wait = min(wait, 60)
+                    print(f"    ⏳ Rate limited (429) — waiting {wait}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                return resp
+            except requests.exceptions.RequestException:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(2)
+        return resp
+
     def fetch_agent_list(self, max_results: Optional[int] = None) -> List[Dict]:
         """
         Fetch the list of available agents from the MCP registry with pagination.
@@ -79,7 +118,7 @@ class MCPRegistryScraper:
 
                 try:
                     print(f"  📡 Fetching page {page}...")
-                    response = self.session.get(base_endpoint, params=params, timeout=10)
+                    response = self.session.get(base_endpoint, params=params, timeout=30)
 
                     if response.status_code != 200:
                         print(f"  ⚠ HTTP {response.status_code}, stopping pagination")
@@ -123,6 +162,8 @@ class MCPRegistryScraper:
                 except requests.exceptions.RequestException as e:
                     print(f"  ✗ Request failed: {e}")
                     break
+
+            return all_agents
 
         except Exception as e:
             print(f"Error fetching agent list: {e}")
@@ -357,8 +398,8 @@ class MCPRegistryScraper:
             if not url:
                 continue
             try:
-                response = self.session.get(url, timeout=10)
-                if response.status_code == 200:
+                response = self._request_with_retry(url, timeout=10)
+                if response and response.status_code == 200:
                     docs['readme'] = response.text
                     print(f"    ✓ Fetched README from {url}")
                     break
@@ -404,8 +445,8 @@ class MCPRegistryScraper:
             # Scrape the detail page
             if detail_page_url:
                 try:
-                    response = self.session.get(detail_page_url, timeout=12)
-                    if response.status_code == 200:
+                    response = self._request_with_retry(detail_page_url, timeout=12)
+                    if response and response.status_code == 200:
                         soup = BeautifulSoup(response.text, 'html.parser')
                         
                         # Remove noise
@@ -612,8 +653,9 @@ class MCPRegistryScraper:
                 print(f"  [{idx}/{len(candidates)}] {name}  (pricing={pricing}, docs={doc_src})")
             return result
 
-        print(f"  Processing {len(candidates)} agents (max_workers={max_workers})...")
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        doc_workers = min(max_workers, 5)
+        print(f"  Processing {len(candidates)} agents (max_workers={doc_workers})...")
+        with ThreadPoolExecutor(max_workers=doc_workers) as executor:
             futures = {executor.submit(_worker, a): a for a in candidates}
             for future in as_completed(futures):
                 result = future.result()
@@ -771,8 +813,8 @@ class PricingExtractor:
 
         def _try(url):
             try:
-                resp = requests.get(url, timeout=5, allow_redirects=True)
-                if resp.status_code == 200:
+                resp = _get_with_retry(url, timeout=5, allow_redirects=True)
+                if resp and resp.status_code == 200:
                     return url, resp.text
             except Exception:
                 pass
@@ -934,8 +976,8 @@ class PricingExtractor:
         # Fast path: LICENSE on main (covers ~90% of repos)
         fast_url = _build_url("LICENSE", "main")
         try:
-            resp = requests.get(fast_url, timeout=5)
-            if resp.status_code == 200:
+            resp = _get_with_retry(fast_url, timeout=5)
+            if resp and resp.status_code == 200:
                 return self._parse_license_text(resp.text)
         except Exception:
             pass
@@ -954,8 +996,8 @@ class PricingExtractor:
         def _try(combo):
             url = _build_url(*combo)
             try:
-                resp = requests.get(url, timeout=5)
-                if resp.status_code == 200:
+                resp = _get_with_retry(url, timeout=5)
+                if resp and resp.status_code == 200:
                     return resp.text
             except Exception:
                 pass
@@ -2294,7 +2336,7 @@ def main(probeable: bool = False, smithery: bool = False):
     # -----------------------------------------------------------------------
     # Configuration
     # -----------------------------------------------------------------------
-    LIMIT = 500      # Set to None to fetch ALL agents from the registry.
+    LIMIT = None      # Set to None to fetch ALL agents from the registry.
 
     # Set to True to enable LLM capability extraction and quality scoring.
     # Requires OPENAI_API_KEY to be set in the environment.

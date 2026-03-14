@@ -117,16 +117,16 @@ Full schema definition: [`schema.json`](schema.json)
 
 ## Cost & Runtime Estimates
 
-Using `gpt-4.1-mini` ($0.40/1M input tokens, $1.60/1M output tokens). All pipeline phases run in parallel using thread pools.
+Using `gpt-4.1-mini` ($0.40/1M input tokens, $1.60/1M output tokens). All pipeline phases run in parallel using thread pools. GitHub requests include 429 retry with exponential backoff, and doc-fetching concurrency is capped at 5 workers to stay within rate limits.
 
 | LIMIT | Agents processed* | LLM Cost | Estimated Runtime |
 |---|---|---|---|
-| 500 | ~400 | ~$0.45 | ~6–7 min |
-| 1000 | ~800 | ~$0.90 | ~12–13 min |
-| 1500 | ~1200 | ~$1.35 | ~18–19 min |
-| None | ~2000–2500 | ~$2.25–$3.30 | ~26–30 min |
+| 500 | ~400 | ~$0.45 | ~10–12 min |
+| 1000 | ~800 | ~$0.90 | ~20–25 min |
+| 1500 | ~1200 | ~$1.35 | ~30–38 min |
+| None | ~2000–2500 | ~$2.25–$3.30 | ~50–65 min |
 
-*\*After dedup and 404 filtering. ~15% of agents are successfully probed via MCP protocol and skip LLM capability extraction (classification still runs).*
+*\*After dedup and 404 filtering. ~15% of agents are successfully probed via MCP protocol and skip LLM capability extraction (classification still runs). Runtime increases at higher counts due to GitHub rate-limit retries.*
 
 **Breakdown by phase** (for LIMIT=500):
 
@@ -134,7 +134,7 @@ Using `gpt-4.1-mini` ($0.40/1M input tokens, $1.60/1M output tokens). All pipeli
 |---|---|---|
 | Pagination | ~10s | Serial API calls |
 | Dedup + 404 check | ~60s | Parallel (10 workers) |
-| Doc fetch + pricing | ~180s | Parallel (10 workers) — largest bottleneck |
+| Doc fetch + pricing | ~360–420s | Parallel (5 workers) — capped at 5 workers + 429 retry backoff |
 | MCP probing | ~50s | Parallel (10 workers) |
 | LLM analysis | ~80s | Parallel (LLM_WORKERS=10) |
 
