@@ -7,11 +7,12 @@ A data pipeline that scrapes AI agent (MCP server) metadata from the official [M
 1. **Scrapes** the MCP registry API with cursor-based pagination
 2. **Captures remote endpoints** (`remotes`) — live MCP server URLs with transport type and auth requirements
 3. **Probes live servers** via MCP protocol (`initialize` + `tools/list`) to get ground-truth tool definitions (name, description, input schema)
-4. **Fetches documentation** for each agent (GitHub README → registry detail page → API description)
-5. **Detects pricing** (free / freemium / paid / open_source) via pricing pages, keyword analysis, LICENSE files, and NPM/PyPI metadata
-6. **Checks availability** — tests remote endpoints first, falls back to source URL; only keeps working remotes
-7. **Classifies** whether entries are true AI agents or API wrappers
-8. **LLM analysis (fallback)** — for agents without live remotes or where probing fails, uses an LLM to extract capabilities, limitations, requirements, and a calibrated quality score. Skipped for successfully probed agents.
+4. **Checks Smithery config** (when `--smithery`) — queries Smithery registry to determine which hosted servers need only a Smithery API key vs external service credentials
+5. **Fetches documentation** for each agent (GitHub README → registry detail page → API description)
+6. **Detects pricing** (free / freemium / paid / open_source) via pricing pages, keyword analysis, LICENSE files, and NPM/PyPI metadata
+7. **Checks availability** — tests remote endpoints first, falls back to source URL; only keeps working remotes
+8. **Classifies** whether entries are true AI agents or API wrappers
+9. **LLM analysis (fallback)** — for agents without live remotes or where probing fails, uses an LLM to extract capabilities, limitations, requirements, and a calibrated quality score. Skipped for successfully probed agents.
 
 Output is saved to `mcp_agents.json`.
 
@@ -35,6 +36,14 @@ To output only free AI agents with accessible remote endpoints and no required a
 
 ```bash
 python3 web_scraper_v2.py --probeable
+```
+
+### Smithery Mode
+
+Like `--probeable`, but also includes Smithery-hosted AI agents that only need a Smithery API key (no external service credentials):
+
+```bash
+python3 web_scraper_v2.py --smithery
 ```
 
 ### LLM Analysis (Optional)
@@ -63,6 +72,7 @@ CLI flags:
 | Flag | Description |
 |---|---|
 | `--probeable` | Only output free AI agents with accessible remotes and no required auth |
+| `--smithery` | Like `--probeable`, plus Smithery-hosted agents needing only a Smithery API key |
 
 ## Pipeline
 
@@ -73,10 +83,16 @@ Scrape registry API
 Probe remotes (MCP initialize + tools/list)
         │
         ▼
+Check Smithery config (--smithery only)
+        │
+        ▼
 Fetch documentation (README / detail page)
         │
         ▼
 LLM analysis (only for agents not successfully probed)
+        │
+        ▼
+Filter (--probeable / --smithery)
         │
         ▼
 Save to mcp_agents.json
@@ -93,6 +109,7 @@ Each agent in `mcp_agents.json` includes:
 - **Documentation** — raw README and detail page text, chunked into ~512-token segments
 - **Availability** — `is_available`, `availability_status`, with dead remotes filtered out
 - **Probe status** — `probe_status` (`success` / `failed` / `skipped`), `probed_tool_count`
+- **Smithery config** — `smithery_config` (`none` / `optional` / `required` / `unknown`) for Smithery-hosted servers
 - **Classification** — whether it's a true AI agent, with rationale
 - **LLM Extracted** (fallback) — `capabilities`, `limitations`, `requirements`, `documentation_quality` score (0.0–1.0)
 

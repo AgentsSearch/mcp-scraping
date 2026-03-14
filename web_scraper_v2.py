@@ -1344,6 +1344,117 @@ class MCPProber:
 
 
 # ---------------------------------------------------------------------------
+# Smithery Config Checker — determines if a Smithery-hosted server needs
+# external service credentials beyond the Smithery API key.
+# ---------------------------------------------------------------------------
+
+class SmitheryConfigChecker:
+    """
+    Queries the Smithery registry (registry.smithery.ai) to determine what
+    configuration each Smithery-hosted server requires.
+
+    Tags each Smithery agent with ``smithery_config``:
+      - 'none'     — no external config, Smithery API key is sufficient
+      - 'optional' — has config fields but none are strictly required
+      - 'required' — needs external service credentials (e.g. API keys)
+      - 'unknown'  — server not found in Smithery registry
+    """
+
+    def __init__(self, timeout: int = 10, max_workers: int = 10):
+        self.timeout = timeout
+        self.max_workers = max_workers
+
+    @staticmethod
+    def _extract_smithery_path(agent: Dict) -> Optional[str]:
+        """Extract the @user/server path from a Smithery remote URL."""
+        for remote in agent.get('remotes', []):
+            url = remote.get('url', '')
+            if 'server.smithery.ai/@' in url:
+                return url.split('server.smithery.ai/@')[1].rstrip('/').rstrip('/mcp')
+        return None
+
+    def _check_single(self, agent: Dict) -> str:
+        """Check a single agent's config requirements. Returns config category."""
+        path = self._extract_smithery_path(agent)
+        if not path:
+            return 'unknown'
+
+        try:
+            url = f'https://registry.smithery.ai/servers/@{path}'
+            req = requests.get(url, timeout=self.timeout, headers={
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': 'application/json',
+            })
+            if req.status_code != 200:
+                return 'unknown'
+
+            data = req.json()
+            connections = data.get('connections', [])
+            if not connections:
+                return 'unknown'
+
+            config_schema = connections[0].get('configSchema', {})
+            properties = config_schema.get('properties', {})
+            required_fields = config_schema.get('required', [])
+
+            if not properties:
+                return 'none'
+
+            # Check if any property is strictly required (in required list, no default, not nullable)
+            for prop_name, prop_def in properties.items():
+                if prop_name not in required_fields:
+                    continue
+                if 'default' in prop_def:
+                    continue
+                if 'null' in str(prop_def.get('anyOf', [])):
+                    continue
+                # This property is required with no default and not nullable
+                return 'required'
+
+            return 'optional'
+
+        except Exception:
+            return 'unknown'
+
+    def check_all(self, agents: List[Dict]) -> List[Dict]:
+        """
+        Check config requirements for all Smithery-hosted agents.
+
+        Mutates each Smithery agent in-place (adds ``smithery_config``)
+        and returns the same list.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        smithery_agents = [a for a in agents if self._extract_smithery_path(a)]
+
+        # Mark non-Smithery agents
+        for a in agents:
+            if not self._extract_smithery_path(a):
+                a['smithery_config'] = None
+
+        if not smithery_agents:
+            print("  No Smithery-hosted agents found.")
+            return agents
+
+        print(f"  Checking config for {len(smithery_agents)} Smithery-hosted agents "
+              f"(max_workers={self.max_workers})...")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self._check_single, a): a for a in smithery_agents}
+            for i, future in enumerate(as_completed(futures), 1):
+                agent = futures[future]
+                config = future.result()
+                agent['smithery_config'] = config
+                print(f"    [{i}/{len(smithery_agents)}] {agent['name']}: {config}")
+
+        from collections import Counter
+        counts = Counter(a.get('smithery_config') for a in smithery_agents)
+        print(f"  Summary: {dict(counts)}")
+
+        return agents
+
+
+# ---------------------------------------------------------------------------
 # Helper: fetch text from the MCP registry's own detail page when there is
 # no GitHub / README link available.
 # ---------------------------------------------------------------------------
@@ -2102,6 +2213,7 @@ class DocumentationProcessor:
 
         # --- Step 2: LLM analysis ---
         if self.llm_analyser is not None and not skip_llm:
+            # Full LLM pipeline: capability extraction + classification
             llm_result = self.llm_analyser.analyse(agent)
             agent["llm_extracted"] = {
                 "capabilities": llm_result.get("capabilities", []),
@@ -2112,13 +2224,28 @@ class DocumentationProcessor:
             agent["quality_rationale"]       = llm_result.get("quality_rationale",  "")
             agent["llm_text_source"]         = llm_result.get("text_source",        "unknown")
 
-            # Agent-type classification (AI agent vs API wrapper)
+            cls_result = self.llm_analyser.classify_agent_type(agent)
+            agent["is_ai_agent"]              = cls_result["is_ai_agent"]
+            agent["agent_classification"]     = cls_result["agent_classification"]
+            agent["classification_rationale"] = cls_result["classification_rationale"]
+        elif self.llm_analyser is not None and skip_llm:
+            # Probed agent: skip capability extraction, still run classification
+            agent["llm_extracted"] = {
+                "capabilities": [],
+                "limitations":  [],
+                "requirements": [],
+            }
+            agent["documentation_quality"] = 0.0
+            agent["quality_rationale"]     = "Skipped — tools obtained via MCP protocol."
+            agent["llm_text_source"]       = "none"
+
+            print(f"    🏷️  Running LLM classification...")
             cls_result = self.llm_analyser.classify_agent_type(agent)
             agent["is_ai_agent"]              = cls_result["is_ai_agent"]
             agent["agent_classification"]     = cls_result["agent_classification"]
             agent["classification_rationale"] = cls_result["classification_rationale"]
         else:
-            # No LLM configured — leave placeholders
+            # No LLM configured at all
             agent["llm_extracted"] = {
                 "capabilities": [],
                 "limitations":  [],
@@ -2144,7 +2271,7 @@ class DocumentationProcessor:
         return agent
 
 
-def main(probeable: bool = False):
+def main(probeable: bool = False, smithery: bool = False):
     """Main execution function."""
     print("="*70)
     print("MCP REGISTRY WEB SCRAPER")
@@ -2189,6 +2316,15 @@ def main(probeable: bool = False):
     probed_ok = sum(1 for a in agents if a.get('probe_status') == 'success')
     print(f"\n  ✅ Successfully probed: {probed_ok}/{len(agents)} agents")
 
+    # Step 1.6: Check Smithery config requirements (only when --smithery flag is used)
+    if smithery:
+        print("\n" + "="*70)
+        print("STEP 1.6: CHECKING SMITHERY CONFIG REQUIREMENTS")
+        print("="*70)
+
+        config_checker = SmitheryConfigChecker(timeout=10, max_workers=10)
+        agents = config_checker.check_all(agents)
+
     # Step 2: Set up optional LLM analyser
     llm_analyser = None
     if ENABLE_LLM:
@@ -2232,23 +2368,44 @@ def main(probeable: bool = False):
             time.sleep(LLM_DELAY)
 
     # Optional filter: only probeable AI agents
-    if probeable:
+    if probeable or smithery:
         print("\n" + "="*70)
-        print("FILTERING: PROBEABLE AI AGENTS ONLY")
+        if smithery:
+            print("FILTERING: PROBEABLE + SMITHERY AI AGENTS")
+        else:
+            print("FILTERING: PROBEABLE AI AGENTS ONLY")
         print("="*70)
         before = len(processed_agents)
-        processed_agents = [
-            a for a in processed_agents
-            if a.get('agent_classification') == 'ai_agent'
-            and a.get('remotes')
-            and a.get('pricing') in ('free', 'open_source')
-            and not any(
-                h.get('isRequired')
-                for r in a.get('remotes', [])
-                for h in r.get('headers', [])
+
+        def _is_probeable(a):
+            return (
+                a.get('agent_classification') == 'ai_agent'
+                and a.get('remotes')
+                and a.get('pricing') in ('free', 'open_source')
+                and not any(
+                    h.get('isRequired')
+                    for r in a.get('remotes', [])
+                    for h in r.get('headers', [])
+                )
             )
-        ]
-        print(f"  Filtered {before} -> {len(processed_agents)} probeable agents")
+
+        def _is_smithery_accessible(a):
+            """Smithery-hosted agent that only needs a Smithery API key."""
+            return (
+                a.get('agent_classification') == 'ai_agent'
+                and a.get('remotes')
+                and a.get('smithery_config') == 'none'
+            )
+
+        if smithery:
+            processed_agents = [
+                a for a in processed_agents
+                if _is_probeable(a) or _is_smithery_accessible(a)
+            ]
+        else:
+            processed_agents = [a for a in processed_agents if _is_probeable(a)]
+
+        print(f"  Filtered {before} -> {len(processed_agents)} agents")
 
     # Step 3: Save results
     print("\n" + "="*70)
@@ -2332,9 +2489,14 @@ def parse_args():
         action="store_true",
         help="Only output AI agents that have accessible remote endpoints and are free (open_source pricing, no required auth headers).",
     )
+    parser.add_argument(
+        "--smithery",
+        action="store_true",
+        help="Like --probeable, but also includes Smithery-hosted agents that only need a Smithery API key (no external service credentials).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(probeable=args.probeable)
+    main(probeable=args.probeable, smithery=args.smithery)
