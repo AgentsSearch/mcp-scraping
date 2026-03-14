@@ -30,7 +30,7 @@ import argparse
 import requests
 import json
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 from urllib.parse import urljoin, urlparse
 from dotenv import load_dotenv
@@ -223,45 +223,48 @@ class MCPRegistryScraper:
             Agent data in unified schema format
         """
         # Generate unique agent_id from source and name
-        mcp_agent_meta = mcp_agent.get('_meta')
-        mcp_agent = mcp_agent.get('server')
+        mcp_agent_meta = mcp_agent.get('_meta') or {}
+        mcp_agent = mcp_agent.get('server') or {}
         source_name = mcp_agent.get('name', 'unknown')
         agent_id = hashlib.md5(f"mcp_{source_name}".encode()).hexdigest()[:16]
-        
+
         # Extract source URL
         source_url = (
-            mcp_agent.get('repository', {}).get('url') or 
+            mcp_agent.get('repository', {}).get('url') or
             mcp_agent.get('websiteUrl') or
-            mcp_agent.get('remotes', [{}])[0].get('url') or 
+            mcp_agent.get('remotes', [{}])[0].get('url') or
             ''
         )
-        
+
+        # Safely extract last_updated from nested _meta
+        registry_meta = mcp_agent_meta.get('io.modelcontextprotocol.registry/official') or {}
+        last_updated = registry_meta.get('updatedAt', 'Unknown')
+
         unified = {
             # Identity
             'agent_id': agent_id,
             'name': mcp_agent.get('name', 'Unknown'),
             'source': 'mcp',
             'source_url': source_url,
-            
+
             # Description
             'description': mcp_agent.get('description', ''),
-            # 'short_description': (mcp_agent.get('description', '')[:200] + '...') if len(mcp_agent.get('description', '')) > 200 else mcp_agent.get('description', ''),
-            
+
             # Capabilities
             'tools': mcp_agent.get('tools', []),
             'detected_capabilities': self._extract_capabilities(mcp_agent),
             'llm_backbone': mcp_agent.get('framework') or mcp_agent.get('llm_backbone') or 'Unknown',
-            
+
             # Evaluation Data
             'arena_elo': mcp_agent.get('arena_elo'),
             'arena_battles': mcp_agent.get('arena_battles'),
             'community_rating': mcp_agent.get('rating'),
             'rating_count': mcp_agent.get('rating_count', 0),
-            
+
             # Metadata
             'pricing': mcp_agent.get('pricing', 'unknown'),
-            'last_updated': mcp_agent_meta.get('io.modelcontextprotocol.registry/official').get('updatedAt', 'Unknown'),
-            'indexed_at': datetime.utcnow().isoformat(),
+            'last_updated': last_updated,
+            'indexed_at': datetime.now(timezone.utc).isoformat(),
             
             # Computed
             'description_embedding': None,
@@ -510,12 +513,11 @@ class MCPRegistryScraper:
         print(f"📊 Found {len(agent_list)} raw entries to process")
 
         # ------------------------------------------------------------------
-        # Phase 1: Fast dedup + 404 check (serial, lightweight)
+        # Phase 1: Dedup (serial) + parallel 404 check
         # ------------------------------------------------------------------
         seen_urls: set = set()
-        candidates = []   # (agent_data, url) tuples that survived dedup
+        deduped = []      # agents that survived dedup, pending 404 check
         skipped_dupes = 0
-        skipped_404 = 0
 
         for agent_data in agent_list:
             server = agent_data.get('server', {})
@@ -535,44 +537,59 @@ class MCPRegistryScraper:
             if dedup_key:
                 seen_urls.add(dedup_key)
 
-            # Quick 404 check: try remotes first, fall back to source_url
+            deduped.append((agent_data, source_url, remote_urls, dedup_key))
+
+        print(f"  ⏭️  Skipped {skipped_dupes} duplicates")
+        print(f"  🔍 Running parallel 404 checks on {len(deduped)} agents...")
+
+        def _check_404(item):
+            """Return (agent_data, is_alive) for a single deduped entry."""
+            agent_data, source_url, remote_urls, dedup_key = item
+
             if remote_urls:
                 any_alive = False
                 for rurl in remote_urls:
                     try:
-                        head = self.session.head(rurl, timeout=5, allow_redirects=True)
+                        head = requests.head(rurl, timeout=5, allow_redirects=True)
                         if head.status_code != 404:
                             any_alive = True
+                            break
                     except Exception:
                         any_alive = True  # non-404 errors are fine
+                        break
                 if not any_alive:
-                    # All remotes returned 404 — fall back to source_url
                     if source_url:
                         try:
-                            head = self.session.head(source_url, timeout=5, allow_redirects=True)
+                            head = requests.head(source_url, timeout=5, allow_redirects=True)
                             if head.status_code == 404:
-                                skipped_404 += 1
                                 print(f"  ✗ 404 (all remotes + source): {dedup_key}")
-                                continue
+                                return (agent_data, False)
                         except Exception:
                             pass
                     else:
-                        skipped_404 += 1
                         print(f"  ✗ 404 (all remotes, no source): {dedup_key}")
-                        continue
+                        return (agent_data, False)
             elif source_url:
                 try:
-                    head = self.session.head(source_url, timeout=5, allow_redirects=True)
+                    head = requests.head(source_url, timeout=5, allow_redirects=True)
                     if head.status_code == 404:
-                        skipped_404 += 1
                         print(f"  ✗ 404: {source_url}")
-                        continue
+                        return (agent_data, False)
                 except Exception:
                     pass
 
-            candidates.append(agent_data)
+            return (agent_data, True)
 
-        print(f"  ⏭️  Skipped {skipped_dupes} duplicates, {skipped_404} dead URLs (404)")
+        candidates = []
+        skipped_404 = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for agent_data, is_alive in executor.map(_check_404, deduped):
+                if is_alive:
+                    candidates.append(agent_data)
+                else:
+                    skipped_404 += 1
+
+        print(f"  ⏭️  Skipped {skipped_404} dead URLs (404)")
         print(f"  ✅ {len(candidates)} unique agents to process\n")
 
         # ------------------------------------------------------------------
@@ -1610,7 +1627,7 @@ class LLMAnalyser:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-5.2",          # swap to "gpt-5" when available
+        model: str = "gpt-4.1-mini",
         registry_scraper: Optional[RegistryPageScraper] = None,
         registry_base_url: str = "https://registry.mcp.run",
         request_timeout: int = 30,
