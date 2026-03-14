@@ -756,31 +756,34 @@ class PricingExtractor:
     def _check_pricing_page(self, source_url: str) -> str:
         """
         Check if there's a /pricing or /pricing.html page.
-        This is the most reliable way to detect freemium models.
-        
-        Example: https://example.com/mcp-server/pricing shows free + paid plans
+        Fires all candidate URLs in parallel, returns first hit.
         """
+        from concurrent.futures import ThreadPoolExecutor
+
         parsed = urlparse(source_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        
-        # Try common pricing page patterns
+        base = base_url.rstrip('/')
+
         pricing_urls = [
-            f"{base_url.rstrip('/')}/pricing",
-            f"{base_url.rstrip('/')}/pricing.html",
-            f"{base_url.rstrip('/')}/pricing/",
-            f"{base_url.rstrip('/')}/plans",
-            f"{base_url.rstrip('/')}/plans.html",
+            f"{base}/pricing", f"{base}/pricing.html",
+            f"{base}/pricing/", f"{base}/plans", f"{base}/plans.html",
         ]
-        
-        for pricing_url in pricing_urls:
+
+        def _try(url):
             try:
-                response = self.session.get(pricing_url, timeout=5, allow_redirects=True)
-                if response.status_code == 200:
-                    print(f"    ✓ Found pricing page: {pricing_url}")
-                    return self._analyze_pricing_page(response.text)
+                resp = requests.get(url, timeout=5, allow_redirects=True)
+                if resp.status_code == 200:
+                    return url, resp.text
             except Exception:
-                continue
-        
+                pass
+            return None, None
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            for url, html in executor.map(_try, pricing_urls):
+                if html is not None:
+                    print(f"    ✓ Found pricing page: {url}")
+                    return self._analyze_pricing_page(html)
+
         return "unknown"
     
     def _analyze_pricing_page(self, html: str) -> str:
@@ -905,46 +908,64 @@ class PricingExtractor:
     
     def _fetch_license_file(self, repo_url: str) -> str:
         """
-        Fetch LICENSE file directly from GitHub/GitLab.
-        This is a single HTTP request to get the raw LICENSE file.
+        Fetch LICENSE file from GitHub/GitLab.
+        Fast path: try LICENSE on main first. Parallel fallback for the rest.
         """
+        from concurrent.futures import ThreadPoolExecutor
+
         parsed = urlparse(repo_url)
         path_parts = [p for p in parsed.path.strip('/').split('/') if p]
-        
+
         if len(path_parts) < 2:
             return "unknown"
-        
+
         owner, repo = path_parts[0], path_parts[1]
-        
-        # Try common LICENSE file names
-        license_filenames = [
+        is_github = 'github.com' in parsed.netloc
+        is_gitlab = 'gitlab.com' in parsed.netloc
+
+        if not (is_github or is_gitlab):
+            return "unknown"
+
+        def _build_url(filename, branch):
+            if is_github:
+                return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{filename}"
+            return f"https://gitlab.com/{owner}/{repo}/-/raw/{branch}/{filename}"
+
+        # Fast path: LICENSE on main (covers ~90% of repos)
+        fast_url = _build_url("LICENSE", "main")
+        try:
+            resp = requests.get(fast_url, timeout=5)
+            if resp.status_code == 200:
+                return self._parse_license_text(resp.text)
+        except Exception:
+            pass
+
+        # Parallel fallback: remaining combos
+        filenames = [
             "LICENSE", "LICENSE.md", "LICENSE.txt",
             "COPYING", "COPYING.md", "COPYING.txt",
-            "LICENSE-MIT", "LICENSE-APACHE"
+            "LICENSE-MIT", "LICENSE-APACHE",
         ]
-        
-        for filename in license_filenames:
-            if 'github.com' in parsed.netloc:
-                # Try both main and master branches
-                for branch in ["main", "master"]:
-                    license_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{filename}"
-                    try:
-                        response = self.session.get(license_url, timeout=5)
-                        if response.status_code == 200:
-                            return self._parse_license_text(response.text)
-                    except:
-                        continue
-            
-            elif 'gitlab.com' in parsed.netloc:
-                for branch in ["main", "master"]:
-                    license_url = f"https://gitlab.com/{owner}/{repo}/-/raw/{branch}/{filename}"
-                    try:
-                        response = self.session.get(license_url, timeout=5)
-                        if response.status_code == 200:
-                            return self._parse_license_text(response.text)
-                    except:
-                        continue
-        
+        combos = [
+            (f, b) for f in filenames for b in ["main", "master"]
+            if not (f == "LICENSE" and b == "main")  # already tried
+        ]
+
+        def _try(combo):
+            url = _build_url(*combo)
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    return resp.text
+            except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for text in executor.map(_try, combos):
+                if text is not None:
+                    return self._parse_license_text(text)
+
         return "unknown"
     
     def _parse_license_text(self, license_text: str) -> str:
@@ -1031,137 +1052,6 @@ class PricingExtractor:
             print(f"    ✗ PyPI check failed: {e}")
         
         return "unknown"
-
-
-# ---------------------------------------------------------------------------
-# AvailabilityChecker — concurrent HTTP probes to verify server reachability
-# ---------------------------------------------------------------------------
-
-class AvailabilityChecker:
-    """
-    Checks whether MCP server URLs are reachable via HTTP.
-
-    For each agent, sends a HEAD request (with GET fallback) to the source_url
-    and tags the agent with ``is_available`` and ``availability_status``.
-
-    Uses ``concurrent.futures.ThreadPoolExecutor`` for parallel checks.
-    """
-
-    def __init__(
-        self,
-        timeout: int = 8,
-        max_workers: int = 20,
-    ):
-        self.timeout = timeout
-        self.max_workers = max_workers
-
-    # ------------------------------------------------------------------
-    # URL classification
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _classify_url(source_url: str) -> str:
-        """Classify a source_url as 'http_endpoint', 'github_repo', or 'no_url'."""
-        if not source_url or not source_url.startswith('http'):
-            return 'no_url'
-        parsed = urlparse(source_url)
-        if 'github.com' in parsed.netloc:
-            return 'github_repo'
-        return 'http_endpoint'
-
-    # ------------------------------------------------------------------
-    # Single-agent check
-    # ------------------------------------------------------------------
-
-    def _probe_url(self, url: str) -> Optional[bool]:
-        """
-        Probe a single URL. Returns True (reachable), False (unreachable),
-        or None (unknown/error).
-        """
-        try:
-            resp = requests.head(url, timeout=self.timeout, allow_redirects=True)
-            # Some servers reject HEAD — fall back to a streaming GET
-            if resp.status_code in (405, 501):
-                resp = requests.get(url, timeout=self.timeout, stream=True)
-                resp.close()
-            return resp.status_code < 400
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-            return False
-        except Exception:
-            return None
-
-    def _check_single(self, agent: Dict) -> Dict:
-        """
-        Probe a single agent and return availability info.
-
-        For agents with remotes: tests each remote URL, keeps only working
-        ones in ``agent['remotes']``. If none work, falls back to source_url.
-
-        Returns dict with keys ``is_available`` (bool | None) and
-        ``availability_status`` ('reachable' | 'unreachable' | 'unknown').
-        """
-        remotes = agent.get('remotes', [])
-        source_url = agent.get('source_url', '')
-
-        # --- Try remotes first ---
-        if remotes:
-            working_remotes = []
-            for remote in remotes:
-                rurl = remote.get('url', '')
-                if not rurl:
-                    continue
-                result = self._probe_url(rurl)
-                if result is True or result is None:
-                    # Keep reachable or ambiguous remotes (only drop confirmed dead)
-                    working_remotes.append(remote)
-
-            if working_remotes:
-                agent['remotes'] = working_remotes
-                return {'is_available': True, 'availability_status': 'reachable'}
-
-            # All remotes failed — clear them and fall back to source_url
-            agent['remotes'] = []
-
-        # --- Fall back to source_url ---
-        if not source_url or not source_url.startswith('http'):
-            return {'is_available': None, 'availability_status': 'unknown'}
-
-        result = self._probe_url(source_url)
-        if result is True:
-            return {'is_available': True, 'availability_status': 'reachable'}
-        elif result is False:
-            return {'is_available': False, 'availability_status': 'unreachable'}
-        return {'is_available': None, 'availability_status': 'unknown'}
-
-    # ------------------------------------------------------------------
-    # Batch (concurrent) check
-    # ------------------------------------------------------------------
-
-    def check_all(self, agents: List[Dict]) -> List[Dict]:
-        """
-        Run availability checks concurrently over *agents*.
-
-        Mutates each agent dict in-place (adds ``is_available`` and
-        ``availability_status``) and returns the same list.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        print(f"  Checking availability of {len(agents)} agents "
-              f"(max_workers={self.max_workers})...")
-
-        def _task(agent):
-            result = self._check_single(agent)
-            agent['is_available'] = result['is_available']
-            agent['availability_status'] = result['availability_status']
-            return agent['name'], result['availability_status']
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(_task, a): a for a in agents}
-            for i, future in enumerate(as_completed(futures), 1):
-                name, status = future.result()
-                print(f"    [{i}/{len(agents)}] {name}: {status}")
-
-        return agents
 
 
 # ---------------------------------------------------------------------------
@@ -1664,54 +1554,47 @@ class LLMAnalyser:
     # Public interface
     # ------------------------------------------------------------------
 
-    def analyse(self, agent: Dict) -> Dict:
+    def analyse_and_classify(self, agent: Dict) -> Dict:
         """
-        Run LLM analysis on a single agent and return extracted metadata.
-
-        Args:
-            agent: Unified-schema agent dict (must contain at least 'name').
+        Run combined LLM analysis + classification in a single API call.
 
         Returns:
             Dict with keys:
-                capabilities    – list[str]
-                limitations     – list[str]
-                requirements    – list[str]
-                quality_score   – float 0.0-1.0
-                quality_rationale – str  (why the LLM gave that score)
-                text_source     – str   ("readme" | "detail_page" | "description_only")
+                capabilities, limitations, requirements, quality_score,
+                quality_rationale, text_source,
+                is_ai_agent, agent_classification, classification_rationale
         """
         text, source_label = self._choose_best_text(agent)
 
         if not text.strip():
             print(f"    ⚠  No usable text found for '{agent.get('name')}' — skipping LLM call.")
-            return self._empty_result("description_only")
+            return {**self._empty_result("description_only"), **self._empty_classification()}
 
         truncated = self._truncate(text)
-        print(f"    🤖 Running LLM analysis (source: {source_label}, {len(truncated)} chars)...")
+        print(f"    🤖 Running LLM analysis + classification (source: {source_label}, {len(truncated)} chars)...")
 
         raw = self._call_openai(
-            system_prompt=self._build_system_prompt(source_label),
+            system_prompt=self._build_combined_system_prompt(source_label),
             user_content=self._build_user_prompt(agent.get('name', ''), truncated, source_label),
         )
 
         if raw is None:
-            return self._empty_result(source_label)
+            return {**self._empty_result(source_label), **self._empty_classification()}
 
-        result = self._parse_response(raw)
+        result = self._parse_combined_response(raw)
         result["text_source"] = source_label
         return result
 
+    def analyse(self, agent: Dict) -> Dict:
+        """Run LLM analysis only (backward compat wrapper)."""
+        combined = self.analyse_and_classify(agent)
+        return {k: combined[k] for k in (
+            "capabilities", "limitations", "requirements",
+            "quality_score", "quality_rationale", "text_source",
+        )}
+
     def analyse_batch(self, agents: List[Dict], delay: float = 1.0) -> List[Dict]:
-        """
-        Run analyse() over a list of agents with a small inter-request delay.
-
-        Args:
-            agents: List of unified-schema agent dicts.
-            delay:  Seconds to sleep between API calls (rate-limit courtesy).
-
-        Returns:
-            List of result dicts (same order as input).
-        """
+        """Run analyse() over a list of agents with a small inter-request delay."""
         results = []
         for i, agent in enumerate(agents, 1):
             print(f"\n  [{i}/{len(agents)}] Analysing: {agent.get('name', '?')}")
@@ -1820,6 +1703,73 @@ JSON structure:
 }}"""
 
     @staticmethod
+    def _build_combined_system_prompt(source_label: str) -> str:
+        source_note = {
+            "readme": (
+                "You are analysing a full README file — this should give you rich "
+                "information.  Score quality generously only when the documentation "
+                "is genuinely comprehensive (installation, usage examples, tool "
+                "descriptions, limitations)."
+            ),
+            "detail_page": (
+                "You are analysing text scraped from the server's registry detail "
+                "page.  This is a secondary source — it may be less structured than "
+                "a README.  Reflect this in the quality score: a detail page that "
+                "lacks examples or installation instructions should score no higher "
+                "than 0.55."
+            ),
+            "description_only": (
+                "You are analysing a short description string only — the server has "
+                "no README or detail page available.  Be conservative: even a very "
+                "good one-liner should cap at 0.30 because there is simply not enough "
+                "information to evaluate the server fully."
+            ),
+        }.get(source_label, "")
+
+        return f"""You are an expert AI/developer tools analyst.
+Your task is to analyse documentation for an MCP (Model Context Protocol) server
+and return a structured JSON object with BOTH capability analysis AND classification.
+
+{source_note}
+
+Classification definitions:
+- "ai_agent": The server uses AI/ML models, language models, or autonomous reasoning
+  internally. It has its own intelligence layer, not just routing. Examples: a server
+  that autonomously writes code, summarises documents, plans tasks using an embedded LLM.
+- "api_wrapper": The server is a thin adapter that exposes an existing non-AI API
+  (database, REST service, file system, etc.) to MCP clients. It executes deterministic
+  operations without AI reasoning. The calling LLM is the intelligence; this server
+  is just plumbing.
+- If >50% of functionality is AI-driven, classify as "ai_agent"; otherwise "api_wrapper".
+
+Return ONLY valid JSON — no markdown fences, no commentary.
+
+JSON structure:
+{{
+  "capabilities": [
+    // List of concise strings describing what the server CAN do.
+    // Each string should start with an active verb. 3-10 items.
+  ],
+  "limitations": [
+    // Known constraints, rate limits, scope restrictions. Empty list if none mentioned.
+  ],
+  "requirements": [
+    // API keys, auth tokens, software versions, accounts. Empty list if none mentioned.
+  ],
+  "quality_score": 0.0,
+  // Float 0.0-1.0.  Scoring rubric:
+  //   0.00-0.20  Almost no information
+  //   0.21-0.40  Basic description only
+  //   0.41-0.60  Some structure (tool list OR examples)
+  //   0.61-0.80  Good docs: tool descriptions + usage examples OR installation
+  //   0.81-1.00  Excellent: installation + examples + limitations + requirements
+  "quality_rationale": "One sentence explaining the score.",
+  "agent_classification": "ai_agent or api_wrapper or unknown",
+  "is_ai_agent": true,
+  "classification_rationale": "One or two sentences explaining the classification."
+}}"""
+
+    @staticmethod
     def _build_user_prompt(name: str, text: str, source_label: str) -> str:
         source_desc = {
             "readme":           "README file",
@@ -1850,7 +1800,7 @@ JSON structure:
         payload = {
             "model": self.model,
             "temperature": 0.1,     # low temperature → more deterministic JSON
-            "max_tokens": 800,
+            "max_tokens": 1000,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_content},
@@ -1932,6 +1882,55 @@ JSON structure:
             "requirements":       requirements,
             "quality_score":      round(quality_score, 3),
             "quality_rationale":  str(data.get('quality_rationale', '')),
+        }
+
+    def _parse_combined_response(self, raw: str) -> Dict:
+        """Parse combined analysis + classification response."""
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            cleaned = re.sub(r'```(?:json)?|```', '', raw).strip()
+            try:
+                data = json.loads(cleaned)
+            except json.JSONDecodeError:
+                print(f"    ✗ Could not parse combined LLM response: {raw[:200]}")
+                return {**self._empty_result("unknown"), **self._empty_classification()}
+
+        # Analysis fields
+        capabilities = self._ensure_str_list(data.get('capabilities'))
+        limitations  = self._ensure_str_list(data.get('limitations'))
+        requirements = self._ensure_str_list(data.get('requirements'))
+
+        raw_score = data.get('quality_score', 0.0)
+        try:
+            quality_score = max(0.0, min(1.0, float(raw_score)))
+        except (TypeError, ValueError):
+            quality_score = 0.0
+
+        # Classification fields
+        classification = str(data.get('agent_classification', 'unknown')).lower()
+        if classification not in ('ai_agent', 'api_wrapper', 'unknown'):
+            classification = 'unknown'
+
+        raw_is_agent = data.get('is_ai_agent')
+        if isinstance(raw_is_agent, bool):
+            is_ai_agent = raw_is_agent
+        elif classification == 'ai_agent':
+            is_ai_agent = True
+        elif classification == 'api_wrapper':
+            is_ai_agent = False
+        else:
+            is_ai_agent = None
+
+        return {
+            "capabilities":             capabilities,
+            "limitations":              limitations,
+            "requirements":             requirements,
+            "quality_score":            round(quality_score, 3),
+            "quality_rationale":        str(data.get('quality_rationale', '')),
+            "is_ai_agent":              is_ai_agent,
+            "agent_classification":     classification,
+            "classification_rationale": str(data.get('classification_rationale', '')),
         }
 
     # ------------------------------------------------------------------
@@ -2230,21 +2229,19 @@ class DocumentationProcessor:
 
         # --- Step 2: LLM analysis ---
         if self.llm_analyser is not None and not skip_llm:
-            # Full LLM pipeline: capability extraction + classification
-            llm_result = self.llm_analyser.analyse(agent)
+            # Single combined API call: capability extraction + classification
+            result = self.llm_analyser.analyse_and_classify(agent)
             agent["llm_extracted"] = {
-                "capabilities": llm_result.get("capabilities", []),
-                "limitations":  llm_result.get("limitations",  []),
-                "requirements": llm_result.get("requirements", []),
+                "capabilities": result.get("capabilities", []),
+                "limitations":  result.get("limitations",  []),
+                "requirements": result.get("requirements", []),
             }
-            agent["documentation_quality"]   = llm_result.get("quality_score",     0.0)
-            agent["quality_rationale"]       = llm_result.get("quality_rationale",  "")
-            agent["llm_text_source"]         = llm_result.get("text_source",        "unknown")
-
-            cls_result = self.llm_analyser.classify_agent_type(agent)
-            agent["is_ai_agent"]              = cls_result["is_ai_agent"]
-            agent["agent_classification"]     = cls_result["agent_classification"]
-            agent["classification_rationale"] = cls_result["classification_rationale"]
+            agent["documentation_quality"]    = result.get("quality_score",            0.0)
+            agent["quality_rationale"]        = result.get("quality_rationale",         "")
+            agent["llm_text_source"]          = result.get("text_source",               "unknown")
+            agent["is_ai_agent"]              = result.get("is_ai_agent")
+            agent["agent_classification"]     = result.get("agent_classification",      "unknown")
+            agent["classification_rationale"] = result.get("classification_rationale",  "")
         elif self.llm_analyser is not None and skip_llm:
             # Probed agent: skip capability extraction, still run classification
             agent["llm_extracted"] = {
@@ -2306,8 +2303,8 @@ def main(probeable: bool = False, smithery: bool = False):
     # Model to use. 
     LLM_MODEL  = "gpt-4.1-mini"
 
-    # Seconds to sleep between LLM API calls (respect rate limits).
-    LLM_DELAY  = 0
+    # Concurrent LLM workers (OpenAI handles concurrency; retries handle 429s).
+    LLM_WORKERS = 10
     # -----------------------------------------------------------------------
 
     # Step 1: Scrape agents
@@ -2367,22 +2364,30 @@ def main(probeable: bool = False, smithery: bool = False):
         llm_analyser=llm_analyser,
     )
 
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     processed_agents = []
-    for i, agent in enumerate(agents, 1):
-        print(f"\n[{i}/{len(agents)}] 📦 Processing: {agent['name']}")
+    lock = threading.Lock()
+    counter = [0]
 
-        if agent.get('probe_status') == 'success':
-            # Tools already populated via MCP protocol — skip LLM capability extraction
-            print(f"    ⚡ Skipping LLM (probed: {agent.get('probed_tool_count', 0)} tools)")
-            processed_agent = processor.process_agent_documentation(agent, skip_llm=True)
+    def _llm_worker(agent):
+        skip = agent.get('probe_status') == 'success'
+        with lock:
+            counter[0] += 1
+            idx = counter[0]
+        if skip:
+            print(f"  [{idx}/{len(agents)}] {agent['name']} — ⚡ probed ({agent.get('probed_tool_count', 0)} tools)")
         else:
-            processed_agent = processor.process_agent_documentation(agent)
+            print(f"  [{idx}/{len(agents)}] {agent['name']} — 🤖 LLM analysis")
+        return processor.process_agent_documentation(agent, skip_llm=skip)
 
-        processed_agents.append(processed_agent)
-
-        # Inter-request delay to avoid hammering the LLM API
-        if llm_analyser and agent.get('probe_status') != 'success' and i < len(agents):
-            time.sleep(LLM_DELAY)
+    print(f"  Processing {len(agents)} agents (LLM_WORKERS={LLM_WORKERS})...")
+    with ThreadPoolExecutor(max_workers=LLM_WORKERS) as executor:
+        futures = {executor.submit(_llm_worker, a): a for a in agents}
+        for future in as_completed(futures):
+            result = future.result()
+            processed_agents.append(result)
 
     # Optional filter: only probeable AI agents
     if probeable or smithery:

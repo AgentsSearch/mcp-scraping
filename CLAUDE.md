@@ -29,24 +29,23 @@ There are no tests, linter, or build system configured.
 
 ## Architecture
 
-The pipeline runs in sequential steps: **scrape agents → check availability → probe MCP servers → check Smithery configs → process documentation (LLM fallback) → save JSON**.
+The pipeline runs in sequential steps: **scrape agents (dedup + parallel 404 check) → probe MCP servers → check Smithery configs → process documentation + LLM analysis (parallel) → save JSON**.
 
 ### Key Classes (all in `web_scraper_v2.py`)
 
-- **MCPRegistryScraper** — Fetches agent list from `registry.modelcontextprotocol.io` API with cursor-based pagination. Converts to unified schema. Fetches documentation via GitHub README (preferred), registry detail page (fallback), or API description (last resort).
-- **PricingExtractor** — Detects pricing model (free/freemium/paid/open_source/unknown) using a priority chain: explicit pricing page → keyword analysis → LICENSE file → NPM/PyPI registry metadata.
-- **AvailabilityChecker** — Tests remote endpoint reachability via HTTP requests with parallel execution using ThreadPoolExecutor.
-- **MCPProber** — Probes live MCP servers using the MCP protocol (sends `initialize` + `tools/list` JSON-RPC requests). Extracts real tool names and counts from running servers. When probing succeeds, LLM analysis is skipped for that agent.
+- **MCPRegistryScraper** — Fetches agent list from `registry.modelcontextprotocol.io` API with cursor-based pagination. Deduplicates by URL, parallel 404-checks, then concurrently fetches documentation (GitHub README preferred, registry detail page fallback) and extracts pricing.
+- **PricingExtractor** — Detects pricing model (free/freemium/paid/open_source/unknown) using a priority chain: explicit pricing page (parallel URL checks) → keyword analysis → LICENSE file (fast-path + parallel fallback) → NPM/PyPI registry metadata.
+- **MCPProber** — Probes live MCP servers using the MCP protocol (sends `initialize` + `tools/list` JSON-RPC requests). Extracts real tool names and counts from running servers. When probing succeeds, LLM capability extraction is skipped for that agent.
 - **SmitheryConfigChecker** — Queries the Smithery registry API to detect Smithery-hosted servers and extract their configuration requirements (e.g., required API keys).
 - **RegistryPageScraper** — Extracts prose content from registry HTML pages, stripping noise elements.
-- **LLMAnalyser** — Calls OpenAI API with source-aware prompts to extract structured capabilities, limitations, requirements, and a calibrated quality score (0.0–1.0). Used as a **fallback** — skipped for agents successfully probed via MCP protocol.
-- **DocumentationProcessor** — Chunks documentation into ~512-token segments with sentence-boundary awareness and overlap, then orchestrates LLM analysis.
+- **LLMAnalyser** — Calls OpenAI API to extract capabilities, limitations, requirements, quality score, and agent classification (ai_agent/api_wrapper) in a single combined API call via `analyse_and_classify()`. Used as a **fallback** — capability extraction is skipped for agents successfully probed via MCP protocol (classification still runs).
+- **DocumentationProcessor** — Chunks documentation into ~512-token segments with sentence-boundary awareness and overlap, then orchestrates parallel LLM analysis across agents.
 
 ### Design Patterns
 
 - **Multi-layer fallback** throughout: documentation sources, pricing detection, URL extraction all cascade through multiple strategies.
 - **Probe-first, LLM-fallback** — MCP probing provides ground-truth tool data; LLM analysis only runs when probing fails or is unavailable.
-- **Parallel execution** — Availability checking and scraping use ThreadPoolExecutor for concurrent processing.
+- **Parallel execution** — 404 checking, scraping, MCP probing, pricing detection, and LLM analysis all use ThreadPoolExecutor for concurrent processing.
 - **Deduplication** via URL tracking to prevent duplicate agents.
 - **Graceful degradation** — Missing API keys, failed requests, and unavailable dependencies are handled without crashing.
 
