@@ -65,7 +65,7 @@ Configuration is set via constants in `main()` of `web_scraper_v2.py`:
 | `LIMIT` | `500` | Max agents to fetch (`None` = all) |
 | `ENABLE_LLM` | `True` | Toggle LLM analysis |
 | `LLM_MODEL` | `"gpt-4.1-mini"` | OpenAI model for analysis |
-| `LLM_DELAY` | `0` | Seconds between LLM API calls |
+| `LLM_WORKERS` | `10` | Concurrent threads for LLM API calls |
 
 CLI flags:
 
@@ -114,6 +114,29 @@ Each agent in `mcp_agents.json` includes:
 - **LLM Extracted** (fallback) — `capabilities`, `limitations`, `requirements`, `documentation_quality` score (0.0–1.0)
 
 Full schema definition: [`schema.json`](schema.json)
+
+## Cost & Runtime Estimates
+
+Using `gpt-4.1-mini` ($0.40/1M input tokens, $1.60/1M output tokens). All pipeline phases run in parallel using thread pools.
+
+| LIMIT | Agents processed* | LLM Cost | Estimated Runtime |
+|---|---|---|---|
+| 500 | ~400 | ~$0.45 | ~6–7 min |
+| 1000 | ~800 | ~$0.90 | ~12–13 min |
+| 1500 | ~1200 | ~$1.35 | ~18–19 min |
+| None | ~2000–2500 | ~$2.25–$3.30 | ~26–30 min |
+
+*\*After dedup and 404 filtering. ~15% of agents are successfully probed via MCP protocol and skip LLM capability extraction (classification still runs).*
+
+**Breakdown by phase** (for LIMIT=500):
+
+| Phase | Time | Notes |
+|---|---|---|
+| Pagination | ~10s | Serial API calls |
+| Dedup + 404 check | ~60s | Parallel (10 workers) |
+| Doc fetch + pricing | ~180s | Parallel (10 workers) — largest bottleneck |
+| MCP probing | ~50s | Parallel (10 workers) |
+| LLM analysis | ~80s | Parallel (LLM_WORKERS=10) |
 
 ## Dependencies
 
