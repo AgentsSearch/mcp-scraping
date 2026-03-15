@@ -26,6 +26,7 @@ Set the environment variable OPENAI_API_KEY before running:
 import os
 import re
 import time
+import random
 import argparse
 import requests
 import json
@@ -39,15 +40,17 @@ load_dotenv()
 
 
 def _get_with_retry(url, timeout=5, max_retries=2, **kwargs):
-    """Module-level GET with 429 retry and exponential backoff."""
+    """Module-level GET with 429 retry, exponential backoff, and jitter."""
     resp = None
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=timeout, **kwargs)
             if resp.status_code == 429:
-                wait = int(resp.headers.get('Retry-After', 2 ** attempt * 5))
-                wait = min(wait, 60)
-                print(f"    ⏳ Rate limited (429) — waiting {wait}s (attempt {attempt+1}/{max_retries})")
+                retry_after = int(resp.headers.get('Retry-After', 0))
+                backoff = 2 ** attempt * 5
+                wait = max(retry_after, backoff) + random.uniform(1, 10)
+                wait = min(wait, 90)
+                print(f"    ⏳ Rate limited (429) — waiting {wait:.0f}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
                 continue
             return resp
@@ -74,15 +77,17 @@ class MCPRegistryScraper:
         self.pricing_extractor = PricingExtractor(session=self.session)
 
     def _request_with_retry(self, url, timeout=10, max_retries=3):
-        """Session GET with 429 retry and exponential backoff."""
+        """Session GET with 429 retry, exponential backoff, and jitter."""
         resp = None
         for attempt in range(max_retries):
             try:
                 resp = self.session.get(url, timeout=timeout)
                 if resp.status_code == 429:
-                    wait = int(resp.headers.get('Retry-After', 2 ** attempt * 5))
-                    wait = min(wait, 60)
-                    print(f"    ⏳ Rate limited (429) — waiting {wait}s (attempt {attempt+1}/{max_retries})")
+                    retry_after = int(resp.headers.get('Retry-After', 0))
+                    backoff = 2 ** attempt * 5
+                    wait = max(retry_after, backoff) + random.uniform(1, 10)
+                    wait = min(wait, 90)
+                    print(f"    ⏳ Rate limited (429) — waiting {wait:.0f}s (attempt {attempt+1}/{max_retries})")
                     time.sleep(wait)
                     continue
                 return resp
