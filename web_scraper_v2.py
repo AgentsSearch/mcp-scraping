@@ -2251,8 +2251,8 @@ class DocumentationProcessor:
              requirements, and a quality score in a single API call.
           3. Store all results back onto the agent dict in-place.
 
-        If no llm_analyser is set or skip_llm is True, LLM fields are left
-        as empty placeholders and the quality score remains 0.0.
+        If no llm_analyser is set, LLM fields are left as empty placeholders
+        and the quality score remains 0.0.
         """
         docs = agent.get("documentation", {})
         all_chunks = []
@@ -2275,7 +2275,7 @@ class DocumentationProcessor:
             all_chunks.extend(detail_chunks)
 
         # --- Step 2: LLM analysis ---
-        if self.llm_analyser is not None and not skip_llm:
+        if self.llm_analyser is not None:
             # Single combined API call: capability extraction + classification
             result = self.llm_analyser.analyse_and_classify(agent)
             agent["llm_extracted"] = {
@@ -2289,22 +2289,6 @@ class DocumentationProcessor:
             agent["is_ai_agent"]              = result.get("is_ai_agent")
             agent["agent_classification"]     = result.get("agent_classification",      "unknown")
             agent["classification_rationale"] = result.get("classification_rationale",  "")
-        elif self.llm_analyser is not None and skip_llm:
-            # Probed agent: skip capability extraction, still run classification
-            agent["llm_extracted"] = {
-                "capabilities": [],
-                "limitations":  [],
-                "requirements": [],
-            }
-            agent["documentation_quality"] = 0.0
-            agent["quality_rationale"]     = "Skipped — tools obtained via MCP protocol."
-            agent["llm_text_source"]       = "none"
-
-            print(f"    🏷️  Running LLM classification...")
-            cls_result = self.llm_analyser.classify_agent_type(agent)
-            agent["is_ai_agent"]              = cls_result["is_ai_agent"]
-            agent["agent_classification"]     = cls_result["agent_classification"]
-            agent["classification_rationale"] = cls_result["classification_rationale"]
         else:
             # No LLM configured at all
             agent["llm_extracted"] = {
@@ -2419,15 +2403,14 @@ def main(probeable: bool = False, smithery: bool = False):
     counter = [0]
 
     def _llm_worker(agent):
-        skip = agent.get('probe_status') == 'success'
         with lock:
             counter[0] += 1
             idx = counter[0]
-        if skip:
-            print(f"  [{idx}/{len(agents)}] {agent['name']} — ⚡ probed ({agent.get('probed_tool_count', 0)} tools)")
-        else:
-            print(f"  [{idx}/{len(agents)}] {agent['name']} — 🤖 LLM analysis")
-        return processor.process_agent_documentation(agent, skip_llm=skip)
+        probed = agent.get('probe_status') == 'success'
+        tool_count = agent.get('probed_tool_count', 0)
+        label = f"⚡ probed ({tool_count} tools) + LLM" if probed else "🤖 LLM analysis"
+        print(f"  [{idx}/{len(agents)}] {agent['name']} — {label}")
+        return processor.process_agent_documentation(agent, skip_llm=False)
 
     print(f"  Processing {len(agents)} agents (LLM_WORKERS={LLM_WORKERS})...")
     with ThreadPoolExecutor(max_workers=LLM_WORKERS) as executor:

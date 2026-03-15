@@ -12,7 +12,7 @@ A data pipeline that scrapes AI agent (MCP server) metadata from the official [M
 6. **Detects pricing** (free / freemium / paid / open_source) via pricing pages, keyword analysis, LICENSE files, and NPM/PyPI metadata
 7. **Checks availability** — tests remote endpoints first, falls back to source URL; only keeps working remotes
 8. **Classifies** whether entries are true AI agents or API wrappers
-9. **LLM analysis (fallback)** — for agents without live remotes or where probing fails, uses an LLM to extract capabilities, limitations, requirements, and a calibrated quality score. Skipped for successfully probed agents.
+9. **LLM analysis** — uses an LLM to extract capabilities, limitations, requirements, and a calibrated quality score for all agents (including probed ones) to ensure searchable capability text for indexing
 
 Output is saved to `mcp_agents.json`.
 
@@ -48,7 +48,7 @@ python3 web_scraper_v2.py --smithery
 
 ### LLM Analysis (Optional)
 
-LLM enrichment is used as a fallback for agents that can't be probed via MCP protocol. To enable:
+LLM enrichment extracts capabilities, limitations, and quality scores for all agents. To enable:
 
 ```bash
 export OPENAI_API_KEY="sk-..."
@@ -89,7 +89,7 @@ Check Smithery config (--smithery only)
 Fetch documentation (README / detail page)
         │
         ▼
-LLM analysis (only for agents not successfully probed)
+LLM analysis (all agents)
         │
         ▼
 Filter (--probeable / --smithery)

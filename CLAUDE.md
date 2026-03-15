@@ -35,16 +35,16 @@ The pipeline runs in sequential steps: **scrape agents (dedup + parallel 404 che
 
 - **MCPRegistryScraper** — Fetches agent list from `registry.modelcontextprotocol.io` API with cursor-based pagination. Deduplicates by URL, parallel 404-checks, then concurrently fetches documentation (GitHub README preferred, registry detail page fallback) and extracts pricing.
 - **PricingExtractor** — Detects pricing model (free/freemium/paid/open_source/unknown) using a priority chain: explicit pricing page (parallel URL checks) → keyword analysis → LICENSE file (fast-path + parallel fallback) → NPM/PyPI registry metadata.
-- **MCPProber** — Probes live MCP servers using the MCP protocol (sends `initialize` + `tools/list` JSON-RPC requests). Extracts real tool names and counts from running servers. When probing succeeds, LLM capability extraction is skipped for that agent.
+- **MCPProber** — Probes live MCP servers using the MCP protocol (sends `initialize` + `tools/list` JSON-RPC requests). Extracts real tool names and counts from running servers.
 - **SmitheryConfigChecker** — Queries the Smithery registry API to detect Smithery-hosted servers and extract their configuration requirements (e.g., required API keys).
 - **RegistryPageScraper** — Extracts prose content from registry HTML pages, stripping noise elements.
-- **LLMAnalyser** — Calls OpenAI API to extract capabilities, limitations, requirements, quality score, and agent classification (ai_agent/api_wrapper) in a single combined API call via `analyse_and_classify()`. Used as a **fallback** — capability extraction is skipped for agents successfully probed via MCP protocol (classification still runs).
+- **LLMAnalyser** — Calls OpenAI API to extract capabilities, limitations, requirements, quality score, and agent classification (ai_agent/api_wrapper) in a single combined API call via `analyse_and_classify()`. Runs on all agents (including probed ones) to ensure searchable capability text for indexing.
 - **DocumentationProcessor** — Chunks documentation into ~512-token segments with sentence-boundary awareness and overlap, then orchestrates parallel LLM analysis across agents.
 
 ### Design Patterns
 
 - **Multi-layer fallback** throughout: documentation sources, pricing detection, URL extraction all cascade through multiple strategies.
-- **Probe-first, LLM-fallback** — MCP probing provides ground-truth tool data; LLM analysis only runs when probing fails or is unavailable.
+- **Probe + LLM enrichment** — MCP probing provides ground-truth tool data; LLM analysis runs on all agents to ensure searchable capability text for indexing.
 - **Parallel execution** — 404 checking, scraping, MCP probing, pricing detection, and LLM analysis all use ThreadPoolExecutor for concurrent processing.
 - **Deduplication** via URL tracking to prevent duplicate agents.
 - **Graceful degradation** — Missing API keys, failed requests, and unavailable dependencies are handled without crashing.
