@@ -34,7 +34,12 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
 import hashlib
 from urllib.parse import urljoin, urlparse
+from fnmatch import fnmatch
+from collections import Counter
 from dotenv import load_dotenv
+from mcp_auth import (MCPAuthManager, API_KEY_REGISTRY as _AUTH_KEY_REGISTRY,
+                       AUTHCODE_PKCE_DOMAINS as _PKCE_DOMAINS,
+                       VENDOR_OAUTH_DOMAINS as _VENDOR_OAUTH_DOMAINS)
 
 load_dotenv()
 
@@ -1102,6 +1107,388 @@ class PricingExtractor:
 
 
 # ---------------------------------------------------------------------------
+# Smithery Registry Scraper — fetches deployed MCP servers from Smithery API
+# ---------------------------------------------------------------------------
+
+class SmitheryRegistryScraper:
+    """
+    Scrapes the Smithery registry (registry.smithery.ai) for deployed remote
+    MCP servers.  Smithery provides tool lists via its API, so no live probing
+    is needed — tools are populated directly from the registry response.
+
+    Each server is converted to the unified agent schema with:
+      - source = "smithery"
+      - probe_status = "smithery_tools"
+      - tools populated from the API response
+    """
+
+    BASE_URL = "https://registry.smithery.ai"
+
+    def __init__(self, timeout: int = 15, max_workers: int = 10):
+        self.timeout = timeout
+        self.max_workers = max_workers
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'MCP-Agent-Search-Engine/1.0',
+            'Accept': 'application/json',
+        })
+
+    def fetch_server_list(self, max_pages: int = 20) -> List[Dict]:
+        """Paginate the Smithery server list (remote + deployed only)."""
+        all_servers = []
+        for page in range(1, max_pages + 1):
+            try:
+                url = f"{self.BASE_URL}/servers"
+                params = {
+                    "remote": "true",
+                    "isDeployed": "true",
+                    "pageSize": 100,
+                    "page": page,
+                }
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+                if resp.status_code != 200:
+                    print(f"    ⚠ Smithery list page {page} returned HTTP {resp.status_code}")
+                    break
+                data = resp.json()
+                servers = data.get("servers", [])
+                if not servers:
+                    break
+                all_servers.extend(servers)
+                print(f"    Page {page}: {len(servers)} servers (total: {len(all_servers)})")
+                # Check if there are more pages
+                pagination = data.get("pagination", {})
+                total = pagination.get("totalCount") or data.get("totalCount") or data.get("total")
+                if total and len(all_servers) >= total:
+                    break
+            except Exception as e:
+                print(f"    ✗ Smithery list page {page} failed: {e}")
+                break
+        return all_servers
+
+    def fetch_server_detail(self, qualified_name: str) -> Optional[Dict]:
+        """Fetch detail for a single server including tools and config schema."""
+        try:
+            url = f"{self.BASE_URL}/servers/{qualified_name}"
+            resp = self.session.get(url, timeout=self.timeout)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
+    def _classify_config(self, config_schema: Dict) -> str:
+        """Classify smithery_config from configSchema (reuse SmitheryConfigChecker logic)."""
+        properties = config_schema.get('properties', {})
+        required_fields = config_schema.get('required', [])
+        if not properties:
+            return 'none'
+        for prop_name, prop_def in properties.items():
+            if prop_name not in required_fields:
+                continue
+            if 'default' in prop_def:
+                continue
+            if 'null' in str(prop_def.get('anyOf', [])):
+                continue
+            return 'required'
+        return 'optional'
+
+    def _convert_single(self, server: Dict, detail: Optional[Dict] = None) -> Dict:
+        """Convert a Smithery server entry to unified schema."""
+        name = server.get('displayName') or server.get('qualifiedName', 'unknown')
+        qualified_name = server.get('qualifiedName', '')
+        description = server.get('description', '')
+        source_url = server.get('homepage') or server.get('sourceUrl') or ''
+
+        agent_id = hashlib.md5(f"smithery_{qualified_name}".encode()).hexdigest()[:16]
+
+        # Extract tools from detail if available (match probed tool shape)
+        tools = []
+        if detail:
+            for tool in detail.get('tools', []):
+                if isinstance(tool, dict):
+                    t = {
+                        'name': tool.get('name', ''),
+                        'description': tool.get('description', ''),
+                    }
+                    if 'inputSchema' in tool:
+                        t['inputSchema'] = tool['inputSchema']
+                    tools.append(t)
+                elif isinstance(tool, str):
+                    tools.append({'name': tool, 'description': ''})
+
+        # Build remote URL
+        deployment_url = ''
+        smithery_config = 'unknown'
+        if detail:
+            deployment_url = detail.get('deploymentUrl', '')
+            connections = detail.get('connections', [])
+            if connections:
+                conn = connections[0]
+                if not deployment_url:
+                    deployment_url = conn.get('deploymentUrl') or conn.get('url', '')
+                config_schema = conn.get('configSchema', {})
+                smithery_config = self._classify_config(config_schema)
+        # Fallback: construct deployment URL from qualified name
+        if not deployment_url and qualified_name:
+            deployment_url = f"https://server.smithery.ai/{qualified_name}/mcp"
+
+        remotes = []
+        if deployment_url:
+            remotes.append({
+                'url': deployment_url,
+                'type': 'streamable-http',
+                'headers': [],
+            })
+
+        return {
+            'agent_id': agent_id,
+            'name': name,
+            'source': 'smithery',
+            'source_url': source_url,
+            'description': description,
+            'tools': tools,
+            'detected_capabilities': [f"tool:{t['name']}" for t in tools if t.get('name')],
+            'llm_backbone': 'Unknown',
+            'arena_elo': None,
+            'arena_battles': None,
+            'community_rating': None,
+            'rating_count': 0,
+            'pricing': 'unknown',
+            'last_updated': server.get('updatedAt', 'Unknown'),
+            'indexed_at': datetime.now(timezone.utc).isoformat(),
+            'description_embedding': None,
+            'testability_tier': 'n/a',
+            'is_available': True,
+            'availability_status': 'reachable',
+            'is_ai_agent': None,
+            'agent_classification': 'unknown',
+            'classification_rationale': '',
+            'remotes': remotes,
+            'probe_status': 'smithery_tools' if tools else 'skipped',
+            'probed_tool_count': len(tools),
+            'smithery_config': smithery_config,
+            'documentation': {},
+        }
+
+    def scrape_all(self) -> List[Dict]:
+        """Fetch server list, then concurrent detail fetches, return unified agents."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print("  Fetching Smithery server list...")
+        servers = self.fetch_server_list()
+        if not servers:
+            print("  No servers found on Smithery.")
+            return []
+        print(f"  Found {len(servers)} deployed remote servers on Smithery")
+
+        # Concurrent detail fetches
+        print(f"  Fetching details (max_workers={self.max_workers})...")
+        details = {}
+
+        def _fetch_detail(srv):
+            qn = srv.get('qualifiedName', '')
+            if qn:
+                return qn, self.fetch_server_detail(qn)
+            return qn, None
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(_fetch_detail, s): s for s in servers}
+            for i, future in enumerate(as_completed(futures), 1):
+                qn, detail = future.result()
+                if detail:
+                    details[qn] = detail
+                if i % 50 == 0:
+                    print(f"    Detail fetch progress: {i}/{len(servers)}")
+
+        print(f"  Got details for {len(details)}/{len(servers)} servers")
+
+        # Convert to unified schema
+        agents = []
+        for srv in servers:
+            qn = srv.get('qualifiedName', '')
+            detail = details.get(qn)
+            agent = self._convert_single(srv, detail)
+            agents.append(agent)
+
+        with_tools = sum(1 for a in agents if a.get('probed_tool_count', 0) > 0)
+        print(f"  Converted {len(agents)} Smithery agents ({with_tools} with tools)")
+        return agents
+
+
+# ---------------------------------------------------------------------------
+# Awesome Remote MCP Servers Scraper — jaw9c/awesome-remote-mcp-servers
+# ---------------------------------------------------------------------------
+
+class AwesomeMCPScraper:
+    """
+    Scrapes the jaw9c/awesome-remote-mcp-servers GitHub README to discover
+    curated remote MCP server endpoints.
+
+    The README contains a markdown table with columns:
+      | Name | Category | URL | Auth | Maintainer |
+
+    Each row is converted to the unified agent schema with source="jaw9c".
+    """
+
+    README_URL = "https://raw.githubusercontent.com/jaw9c/awesome-remote-mcp-servers/main/README.md"
+
+    def __init__(self, timeout: int = 15):
+        self.timeout = timeout
+
+    def fetch_readme(self) -> str:
+        """Fetch the raw README markdown from GitHub."""
+        try:
+            resp = _get_with_retry(self.README_URL, timeout=self.timeout)
+            if resp and resp.status_code == 200:
+                return resp.text
+        except Exception as e:
+            print(f"    ✗ Failed to fetch jaw9c README: {e}")
+        return ""
+
+    def parse_markdown_table(self, markdown: str) -> List[Dict]:
+        """Parse the markdown table rows into structured dicts."""
+        rows = []
+        in_table = False
+        headers = []
+
+        for line in markdown.split('\n'):
+            line = line.strip()
+            if not line.startswith('|'):
+                if in_table:
+                    in_table = False
+                continue
+
+            cells = [c.strip() for c in line.split('|')[1:-1]]  # strip leading/trailing empty
+
+            # Detect header row
+            if not in_table and len(cells) >= 3:
+                # Check if next-ish line is separator (---|---|---)
+                if any('name' in c.lower() for c in cells):
+                    headers = [c.lower().strip() for c in cells]
+                    in_table = True
+                    continue
+
+            # Skip separator row
+            if in_table and all(set(c.strip()) <= {'-', ':', ' '} for c in cells):
+                continue
+
+            if in_table and headers and len(cells) >= len(headers):
+                row = {}
+                for idx, header in enumerate(headers):
+                    row[header] = cells[idx] if idx < len(cells) else ''
+                rows.append(row)
+
+        return rows
+
+    def _extract_url_from_markdown(self, text: str) -> str:
+        """Extract URL from markdown link [text](url), backtick-wrapped, or plain URL."""
+        # Strip backticks (jaw9c uses `url` format)
+        text = text.replace('`', '')
+        md_match = re.search(r'\[.*?\]\((https?://[^\)]+)\)', text)
+        if md_match:
+            return md_match.group(1)
+        url_match = re.search(r'(https?://\S+)', text)
+        if url_match:
+            return url_match.group(1)
+        return ''
+
+    def _extract_name_from_markdown(self, text: str) -> str:
+        """Extract display name from markdown link [Name](url) or plain text."""
+        md_match = re.search(r'\[([^\]]+)\]', text)
+        if md_match:
+            return md_match.group(1)
+        return text.strip()
+
+    def _infer_transport(self, url: str) -> str:
+        """Infer transport type from URL."""
+        if '/sse' in url.lower():
+            return 'sse'
+        return 'streamable-http'
+
+    def _convert_single(self, row: Dict) -> Optional[Dict]:
+        """Convert a parsed table row to unified agent schema."""
+        # Try common column names
+        name_raw = row.get('name', '') or row.get('server', '') or row.get('project', '')
+        url_raw = row.get('url', '') or row.get('endpoint', '') or row.get('link', '')
+        auth_raw = row.get('auth', '') or row.get('authentication', '')
+        category = row.get('category', '') or row.get('type', '')
+        description = row.get('description', '') or category
+
+        name = self._extract_name_from_markdown(name_raw)
+        # Try to get URL from the name column if url column is empty
+        url = self._extract_url_from_markdown(url_raw)
+        if not url:
+            url = self._extract_url_from_markdown(name_raw)
+
+        if not url or not name:
+            return None
+
+        agent_id = hashlib.md5(f"jaw9c_{url}".encode()).hexdigest()[:16]
+        transport = self._infer_transport(url)
+
+        # Build remotes
+        headers = []
+        auth_lower = auth_raw.lower()
+        needs_auth = not any(kw in auth_lower for kw in ['open', 'none', 'free', 'no auth', ''])
+
+        remotes = [{
+            'url': url,
+            'type': transport,
+            'headers': headers,
+        }]
+
+        return {
+            'agent_id': agent_id,
+            'name': name,
+            'source': 'jaw9c',
+            'source_url': url,
+            'description': description,
+            'tools': [],
+            'detected_capabilities': [],
+            'llm_backbone': 'Unknown',
+            'arena_elo': None,
+            'arena_battles': None,
+            'community_rating': None,
+            'rating_count': 0,
+            'pricing': 'unknown',
+            'last_updated': 'Unknown',
+            'indexed_at': datetime.now(timezone.utc).isoformat(),
+            'description_embedding': None,
+            'testability_tier': 'n/a',
+            'is_available': None,
+            'availability_status': 'unknown',
+            'is_ai_agent': None,
+            'agent_classification': 'unknown',
+            'classification_rationale': '',
+            'remotes': remotes,
+            'probe_status': 'skipped',
+            'probed_tool_count': 0,
+            'smithery_config': None,
+            'documentation': {},
+        }
+
+    def scrape_all(self) -> List[Dict]:
+        """Fetch README, parse table, convert to unified agents."""
+        print("  Fetching jaw9c/awesome-remote-mcp-servers README...")
+        readme = self.fetch_readme()
+        if not readme:
+            print("  Failed to fetch README.")
+            return []
+
+        rows = self.parse_markdown_table(readme)
+        print(f"  Parsed {len(rows)} table rows")
+
+        agents = []
+        for row in rows:
+            agent = self._convert_single(row)
+            if agent:
+                agents.append(agent)
+
+        print(f"  Converted {len(agents)} jaw9c agents")
+        return agents
+
+
+# ---------------------------------------------------------------------------
 # MCP Protocol Prober — fetches tool definitions via initialize + tools/list
 # ---------------------------------------------------------------------------
 
@@ -1111,14 +1498,24 @@ class MCPProber:
     definitions using the MCP protocol (initialize → tools/list).
 
     Populates ``agent['tools']`` with ground-truth data and sets
-    ``agent['probe_status']`` to 'success', 'failed', or 'skipped'.
+    ``agent['probe_status']`` to one of:
+      - 'success'        — tools retrieved
+      - 'auth_required'  — server returned 401 (needs credentials)
+      - 'not_found'      — server returned 404 or DNS failure
+      - 'unreachable'    — timeout, connection error, or server error
+      - 'failed'         — other failure
+      - 'skipped'        — no probeable remotes
     """
 
-    def __init__(self, timeout: int = 15, max_workers: int = 10):
+    def __init__(self, timeout: int = 15, max_workers: int = 10,
+                 smithery_api_key: Optional[str] = None,
+                 auth_manager: Optional[MCPAuthManager] = None):
         self.timeout = timeout
         self.max_workers = max_workers
         self.protocol_version = "2024-11-05"
         self.client_info = {"name": "agent-search-engine", "version": "0.1"}
+        self.smithery_api_key = smithery_api_key
+        self.auth_manager = auth_manager
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1146,13 +1543,21 @@ class MCPProber:
             pass
         return None
 
-    @staticmethod
-    def _build_headers(remote: Dict) -> Dict:
+    def _build_headers(self, remote: Dict) -> Dict:
         """Build HTTP headers for an MCP request, including auth if available."""
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/event-stream',
         }
+        url = remote.get('url', '')
+        # Inject Smithery API key for Smithery-hosted servers
+        if self.smithery_api_key and 'server.smithery.ai' in url:
+            headers['Authorization'] = f'Bearer {self.smithery_api_key}'
+        # Inject auth from auth_manager (API keys, OAuth tokens)
+        if self.auth_manager:
+            auth_headers = self.auth_manager.get_auth_headers(url)
+            if auth_headers:
+                headers.update(auth_headers)
         for h in remote.get('headers', []):
             name = h.get('name', '')
             value = h.get('value', '')
@@ -1162,11 +1567,14 @@ class MCPProber:
 
     def _should_probe(self, agent: Dict) -> bool:
         """Return True if agent has at least one remote we can probe."""
+        if agent.get('probe_status') == 'smithery_tools':
+            return False
         remotes = agent.get('remotes', [])
         if not remotes:
             return False
         for remote in remotes:
-            if not remote.get('url'):
+            url = remote.get('url', '')
+            if not url:
                 continue
             # Skip remotes that require auth headers we don't have
             needs_auth = False
@@ -1176,17 +1584,22 @@ class MCPProber:
                     break
             if not needs_auth:
                 return True
+            # If auth_manager can provide auth for this URL, probe it anyway
+            if needs_auth and self.auth_manager and self.auth_manager.has_auth_for(url):
+                return True
         return False
 
     # ------------------------------------------------------------------
     # Single probe
     # ------------------------------------------------------------------
 
-    def _probe_single(self, remote_url: str, headers: Dict) -> Optional[List[Dict]]:
+    def _probe_single(self, remote_url: str, headers: Dict) -> tuple:
         """
         Send MCP initialize + tools/list to a single remote URL.
 
-        Returns list of tool dicts on success, None on failure.
+        Returns (tools_list, failure_reason) where tools_list is a list
+        on success or None on failure, and failure_reason is a string
+        ('auth_required', 'not_found', 'unreachable', 'failed', or None).
         """
         session = requests.Session()
         session.headers.update(headers)
@@ -1202,18 +1615,30 @@ class MCPProber:
         }
         try:
             resp = session.post(remote_url, json=init_payload, timeout=self.timeout)
+            if resp.status_code == 401 or resp.status_code == 403:
+                return (None, 'auth_required')
+            if resp.status_code == 404:
+                return (None, 'not_found')
+            if resp.status_code >= 500:
+                return (None, 'unreachable')
             if resp.status_code not in (200, 201):
-                return None
+                return (None, 'failed')
             init_result = self._parse_sse_response(resp.text)
             if not init_result:
-                return None
+                return (None, 'failed')
 
             # Carry session ID if provided
             mcp_session_id = resp.headers.get('Mcp-Session-Id')
             if mcp_session_id:
                 session.headers['Mcp-Session-Id'] = mcp_session_id
+        except requests.exceptions.ConnectionError as e:
+            if 'NameResolution' in str(e) or 'nodename' in str(e):
+                return (None, 'not_found')
+            return (None, 'unreachable')
+        except requests.exceptions.Timeout:
+            return (None, 'unreachable')
         except (requests.exceptions.RequestException, json.JSONDecodeError):
-            return None
+            return (None, 'failed')
 
         # Step 2: tools/list
         tools_payload = {
@@ -1222,13 +1647,13 @@ class MCPProber:
         try:
             resp = session.post(remote_url, json=tools_payload, timeout=self.timeout)
             if resp.status_code not in (200, 201):
-                return None
+                return (None, 'failed')
             tools_result = self._parse_sse_response(resp.text)
             if not tools_result:
-                return None
-            return tools_result.get('tools', [])
+                return (None, 'failed')
+            return (tools_result.get('tools', []), None)
         except (requests.exceptions.RequestException, json.JSONDecodeError):
-            return None
+            return (None, 'failed')
 
     # ------------------------------------------------------------------
     # Agent-level probe (tries each remote)
@@ -1237,6 +1662,10 @@ class MCPProber:
     def _probe_agent(self, agent: Dict) -> None:
         """Probe an agent's remotes in order. Mutates agent in-place."""
         remotes = agent.get('remotes', [])
+        worst_failure = 'failed'  # Track most informative failure reason
+
+        # Priority: auth_required > not_found > unreachable > failed
+        failure_priority = {'auth_required': 3, 'not_found': 2, 'unreachable': 1, 'failed': 0}
 
         for remote in remotes:
             url = remote.get('url', '')
@@ -1249,17 +1678,26 @@ class MCPProber:
                     needs_auth = True
                     break
             if needs_auth:
-                continue
+                # If auth_manager can provide auth, don't skip
+                if not (self.auth_manager and self.auth_manager.has_auth_for(url)):
+                    worst_failure = 'auth_required'
+                    continue
 
             headers = self._build_headers(remote)
-            tools = self._probe_single(url, headers)
+            tools, failure_reason = self._probe_single(url, headers)
             if tools is not None:
                 agent['tools'] = tools
                 agent['probe_status'] = 'success'
                 agent['probed_tool_count'] = len(tools)
+                agent['is_available'] = True
+                agent['availability_status'] = 'reachable'
                 return
 
-        agent['probe_status'] = 'failed'
+            # Keep the most informative failure reason
+            if failure_reason and failure_priority.get(failure_reason, 0) > failure_priority.get(worst_failure, 0):
+                worst_failure = failure_reason
+
+        agent['probe_status'] = worst_failure
         agent['probed_tool_count'] = 0
 
     # ------------------------------------------------------------------
@@ -1276,11 +1714,12 @@ class MCPProber:
 
         probeable = [a for a in agents if self._should_probe(a)]
 
-        # Mark non-probeable agents
+        # Mark non-probeable agents (preserve existing status like smithery_tools)
         for a in agents:
             if not self._should_probe(a):
-                a['probe_status'] = 'skipped'
-                a['probed_tool_count'] = 0
+                if a.get('probe_status') not in ('success', 'smithery_tools'):
+                    a['probe_status'] = 'skipped'
+                    a['probed_tool_count'] = 0
 
         print(f"  Probing {len(probeable)}/{len(agents)} agents with accessible remotes "
               f"(max_workers={self.max_workers})...")
@@ -1401,7 +1840,6 @@ class SmitheryConfigChecker:
                 agent['smithery_config'] = config
                 print(f"    [{i}/{len(smithery_agents)}] {agent['name']}: {config}")
 
-        from collections import Counter
         counts = Counter(a.get('smithery_config') for a in smithery_agents)
         print(f"  Summary: {dict(counts)}")
 
@@ -2316,8 +2754,101 @@ class DocumentationProcessor:
         return agent
 
 
-def main(probeable: bool = False, smithery: bool = False):
+def _normalize_url(url: str) -> str:
+    """Normalize URL for dedup: lowercase, strip trailing slash."""
+    return url.lower().rstrip('/').rstrip('/mcp').rstrip('/')
+
+
+def merge_agents(official: List[Dict], smithery: List[Dict], jaw9c: List[Dict]) -> List[Dict]:
+    """
+    Merge agents from three sources with deduplication.
+
+    Dedup key: normalized remote URL (first remote).
+    Priority: official > smithery > jaw9c.
+    Overlapping: enrich official agent with Smithery tools (if probe failed).
+    Non-overlapping: append to list.
+    """
+    merged = []
+    url_to_agent: Dict[str, Dict] = {}   # normalized URL → agent
+    url_to_source: Dict[str, str] = {}   # normalized URL → source name
+
+    def _get_dedup_urls(agent: Dict) -> List[str]:
+        urls = []
+        for r in agent.get('remotes', []):
+            u = r.get('url', '')
+            if u:
+                urls.append(_normalize_url(u))
+        src = agent.get('source_url', '')
+        if src:
+            urls.append(_normalize_url(src))
+        return urls
+
+    # Phase 1: Index official agents
+    for agent in official:
+        merged.append(agent)
+        for url in _get_dedup_urls(agent):
+            url_to_agent[url] = agent
+            url_to_source[url] = 'official'
+
+    # Phase 2: Merge Smithery agents
+    smithery_added = 0
+    smithery_enriched = 0
+    for agent in smithery:
+        dedup_urls = _get_dedup_urls(agent)
+        existing = None
+        for url in dedup_urls:
+            if url in url_to_agent:
+                existing = url_to_agent[url]
+                break
+
+        if existing:
+            # Enrich official agent with Smithery tools if probe didn't succeed
+            if existing.get('probe_status') not in ('success', 'smithery_tools'):
+                if agent.get('tools'):
+                    existing['tools'] = agent['tools']
+                    existing['probe_status'] = 'smithery_tools'
+                    existing['probed_tool_count'] = len(agent['tools'])
+                    smithery_enriched += 1
+            # Add smithery_config if not set
+            if existing.get('smithery_config') is None and agent.get('smithery_config'):
+                existing['smithery_config'] = agent['smithery_config']
+        else:
+            merged.append(agent)
+            smithery_added += 1
+            for url in dedup_urls:
+                url_to_agent[url] = agent
+                url_to_source[url] = 'smithery'
+
+    # Phase 3: Merge jaw9c agents
+    jaw9c_added = 0
+    for agent in jaw9c:
+        dedup_urls = _get_dedup_urls(agent)
+        is_dup = any(url in url_to_agent for url in dedup_urls)
+        if not is_dup:
+            merged.append(agent)
+            jaw9c_added += 1
+            for url in dedup_urls:
+                url_to_agent[url] = agent
+                url_to_source[url] = 'jaw9c'
+
+    print(f"  Merge results:")
+    print(f"    Official: {len(official)} agents")
+    print(f"    Smithery: {smithery_added} new + {smithery_enriched} enriched existing")
+    print(f"    jaw9c:    {jaw9c_added} new")
+    print(f"    Total:    {len(merged)} merged agents")
+    return merged
+
+
+def main(probeable: bool = False, smithery: bool = False,
+         setup_auth: bool = False):
     """Main execution function."""
+
+    # Handle --setup-auth early exit
+    auth_manager = MCPAuthManager()
+    if setup_auth:
+        auth_manager.run_interactive_setup()
+        return
+
     print("="*70)
     print("MCP REGISTRY WEB SCRAPER")
     print("="*70)
@@ -2338,16 +2869,51 @@ def main(probeable: bool = False, smithery: bool = False):
     LLM_WORKERS = 10
     # -----------------------------------------------------------------------
 
-    # Step 1: Scrape agents
+    # Step 1a: Scrape agents from official MCP registry
     print("\n" + "="*70)
-    print("STEP 1: SCRAPING AGENTS FROM MCP REGISTRY")
+    print("STEP 1a: SCRAPING AGENTS FROM MCP REGISTRY")
     print("="*70)
 
     scraper = MCPRegistryScraper()
-    agents = scraper.scrape_all_agents(limit=LIMIT)
+    official_agents = scraper.scrape_all_agents(limit=LIMIT)
+
+    if not official_agents:
+        print("\n⚠ No agents from official registry.")
+        official_agents = []
+
+    # Step 1b: Scrape Smithery registry
+    print("\n" + "="*70)
+    print("STEP 1b: SCRAPING SMITHERY REGISTRY")
+    print("="*70)
+
+    smithery_scraper = SmitheryRegistryScraper(timeout=15, max_workers=10)
+    try:
+        smithery_agents = smithery_scraper.scrape_all()
+    except Exception as e:
+        print(f"  ✗ Smithery scraping failed: {e}")
+        smithery_agents = []
+
+    # Step 1c: Scrape jaw9c/awesome-remote-mcp-servers
+    print("\n" + "="*70)
+    print("STEP 1c: SCRAPING jaw9c/awesome-remote-mcp-servers")
+    print("="*70)
+
+    jaw9c_scraper = AwesomeMCPScraper()
+    try:
+        jaw9c_agents = jaw9c_scraper.scrape_all()
+    except Exception as e:
+        print(f"  ✗ jaw9c scraping failed: {e}")
+        jaw9c_agents = []
+
+    # Step 1d: Merge all sources
+    print("\n" + "="*70)
+    print("STEP 1d: MERGING AGENTS FROM ALL SOURCES")
+    print("="*70)
+
+    agents = merge_agents(official_agents, smithery_agents, jaw9c_agents)
 
     if not agents:
-        print("\n❌ No agents were scraped. Exiting.")
+        print("\n❌ No agents after merge. Exiting.")
         return
 
     # Step 1.5: Probe MCP servers for tool definitions
@@ -2355,11 +2921,55 @@ def main(probeable: bool = False, smithery: bool = False):
     print("STEP 1.5: PROBING MCP SERVERS FOR TOOL DEFINITIONS")
     print("="*70)
 
-    prober = MCPProber(timeout=15, max_workers=10)
+    smithery_api_key = os.environ.get("SMITHERY_API_KEY", "")
+    if smithery_api_key:
+        print("  Smithery API key detected — will authenticate Smithery-hosted servers")
+    else:
+        print("  SMITHERY_API_KEY not set — Smithery-hosted servers may fail auth")
+
+    auth_count = sum(1 for e in _AUTH_KEY_REGISTRY
+                     if os.environ.get(e["env_var"], ""))
+    oauth_count = (len(auth_manager._cache.get("oauth_tokens", {}))
+                   + len(auth_manager._cache.get("vendor_oauth", {})))
+    if auth_count or oauth_count:
+        print(f"  Auth manager: {auth_count} API keys, {oauth_count} OAuth tokens loaded")
+
+    prober = MCPProber(timeout=15, max_workers=10,
+                       smithery_api_key=smithery_api_key or None,
+                       auth_manager=auth_manager)
     agents = prober.probe_all(agents)
 
     probed_ok = sum(1 for a in agents if a.get('probe_status') == 'success')
+    probed_auth = sum(1 for a in agents if a.get('probe_status') == 'auth_required')
+    probed_404 = sum(1 for a in agents if a.get('probe_status') == 'not_found')
+    probed_unreach = sum(1 for a in agents if a.get('probe_status') == 'unreachable')
     print(f"\n  ✅ Successfully probed: {probed_ok}/{len(agents)} agents")
+    if probed_auth:
+        print(f"  🔒 Auth required: {probed_auth}")
+    if probed_404:
+        print(f"  🚫 Not found: {probed_404}")
+    if probed_unreach:
+        print(f"  ⏱️  Unreachable: {probed_unreach}")
+    smithery_tools_after_probe = sum(1 for a in agents if a.get('probe_status') == 'smithery_tools')
+    if smithery_tools_after_probe:
+        print(f"  📦 Smithery tools (preserved): {smithery_tools_after_probe}")
+
+    # Step 1.5b: Re-probe auth_required agents that we now have credentials for
+    auth_required_agents = [a for a in agents if a.get('probe_status') == 'auth_required']
+    reprobed_candidates = [a for a in auth_required_agents
+                           if a.get('remotes') and auth_manager.has_auth_for(a['remotes'][0].get('url', ''))]
+    if reprobed_candidates:
+        print(f"\n  Re-probing {len(reprobed_candidates)} auth_required agents with available credentials...")
+        # Temporarily reset their probe_status so _should_probe returns True
+        for a in reprobed_candidates:
+            a['probe_status'] = 'pending_reprobe'
+        reprober = MCPProber(timeout=15, max_workers=10,
+                             smithery_api_key=smithery_api_key or None,
+                             auth_manager=auth_manager)
+        reprober.probe_all(reprobed_candidates)
+        re_ok = sum(1 for a in reprobed_candidates if a.get('probe_status') == 'success')
+        re_still_auth = sum(1 for a in reprobed_candidates if a.get('probe_status') == 'auth_required')
+        print(f"  Re-probe results: {re_ok} success, {re_still_auth} still auth_required")
 
     # Step 1.6: Check Smithery config requirements (only when --smithery flag is used)
     if smithery:
@@ -2369,6 +2979,70 @@ def main(probeable: bool = False, smithery: bool = False):
 
         config_checker = SmitheryConfigChecker(timeout=10, max_workers=10)
         agents = config_checker.check_all(agents)
+
+    # Step 1.7: Assign auth_tier to every agent
+    print("\n" + "="*70)
+    print("STEP 1.7: CLASSIFYING AUTH TIERS")
+    print("="*70)
+
+    def _classify_auth_tier(agent):
+        """Classify how an agent authenticates: open, smithery_key, api_key, oauth, auth_unknown, no_remote."""
+        remotes = agent.get('remotes', [])
+        if not remotes:
+            return 'no_remote'
+        url = remotes[0].get('url', '')
+        if not url:
+            return 'no_remote'
+        parsed = urlparse(url)
+        domain = parsed.hostname or ''
+
+        # Open — probed successfully without auth (or smithery_tools from API)
+        if agent.get('probe_status') == 'success':
+            # Check if auth was actually used
+            if auth_manager.has_auth_for(url):
+                # Was probed with auth — classify by auth type
+                pass
+            else:
+                return 'open'
+        if agent.get('probe_status') == 'smithery_tools':
+            if 'server.smithery.ai' in url or 'smithery' in url:
+                return 'smithery_key'
+            return 'open'
+
+        # Smithery-hosted
+        if 'server.smithery.ai' in url or 'smithery' in url:
+            return 'smithery_key'
+
+        # API key match
+        for entry in _AUTH_KEY_REGISTRY:
+            full = domain + (parsed.path or '')
+            if fnmatch(full, entry['pattern']) or fnmatch(domain, entry['pattern']):
+                return 'api_key'
+
+        # OAuth PKCE
+        if domain in _PKCE_DOMAINS:
+            return 'oauth'
+
+        # Vendor OAuth
+        if domain in _VENDOR_OAUTH_DOMAINS:
+            return 'oauth'
+
+        # Auth required but unknown method
+        if agent.get('probe_status') == 'auth_required':
+            return 'auth_unknown'
+
+        # Default for other statuses (not_found, unreachable, failed, skipped)
+        if agent.get('probe_status') in ('not_found', 'unreachable', 'failed'):
+            return 'auth_unknown'
+
+        return 'open'
+
+    for agent in agents:
+        agent['auth_tier'] = _classify_auth_tier(agent)
+
+    tier_counts = Counter(a['auth_tier'] for a in agents)
+    for tier, count in sorted(tier_counts.items(), key=lambda x: -x[1]):
+        print(f"  {tier:20s}: {count}")
 
     # Step 2: Set up optional LLM analyser
     llm_analyser = None
@@ -2477,7 +3151,14 @@ def main(probeable: bool = False, smithery: bool = False):
     unreachable = sum(1 for a in processed_agents if a.get('availability_status') == 'unreachable')
     ai_agents   = sum(1 for a in processed_agents if a.get('agent_classification') == 'ai_agent')
     api_wrappers = sum(1 for a in processed_agents if a.get('agent_classification') == 'api_wrapper')
+    # Source breakdown
+    from_official = sum(1 for a in processed_agents if a.get('source') == 'mcp')
+    from_smithery = sum(1 for a in processed_agents if a.get('source') == 'smithery')
+    from_jaw9c    = sum(1 for a in processed_agents if a.get('source') == 'jaw9c')
+    smithery_tools_count = sum(1 for a in processed_agents if a.get('probe_status') == 'smithery_tools')
+
     print(f"✅ Total agents processed : {total}")
+    print(f"   Source: official={from_official}, smithery={from_smithery}, jaw9c={from_jaw9c}")
     print(f"✅ Total doc chunks       : {sum(len(a.get('documentation_chunks', [])) for a in processed_agents)}")
     print(f"✅ Avg quality score      : {avg_quality:.2f}")
     print(f"✅ Agents with LLM caps   : {with_caps}/{total}")
@@ -2489,16 +3170,27 @@ def main(probeable: bool = False, smithery: bool = False):
     probe_fail = sum(1 for a in processed_agents if a.get('probe_status') == 'failed')
     total_tools = sum(a.get('probed_tool_count', 0) for a in processed_agents)
     print(f"✅ Probed successfully    : {probed}/{total}")
+    print(f"✅ Smithery tools (no probe): {smithery_tools_count}/{total}")
+    print(f"✅ Usable (probed + smithery): {probed + smithery_tools_count}/{total}")
     print(f"✅ Probe failed           : {probe_fail}/{total}")
     print(f"✅ Total tools discovered : {total_tools}")
+
+    # Auth tier breakdown
+    tier_summary = Counter(a.get('auth_tier', 'unknown') for a in processed_agents)
+    print(f"\n  Auth tier breakdown:")
+    for tier, count in sorted(tier_summary.items(), key=lambda x: -x[1]):
+        print(f"    {tier:20s}: {count}")
+
     print(f"\n📁 Output file: {output_file}")
 
-    # Save filtered subset: reachable AI agents only
-    reachable_ai = [a for a in processed_agents
-                    if a.get('is_available') and a.get('agent_classification') == 'ai_agent']
-    if reachable_ai:
-        ai_file = scraper.save_to_file(reachable_ai, "mcp_ai_agents.json")
-        print(f"📁 Reachable AI agents: {len(reachable_ai)} → {ai_file}")
+    # Save filtered subset: AI agents with confirmed tools
+    usable_ai = [a for a in processed_agents
+                 if a.get('agent_classification') == 'ai_agent'
+                 and a.get('remotes')
+                 and a.get('probed_tool_count', 0) > 0]
+    if usable_ai:
+        ai_file = scraper.save_to_file(usable_ai, "mcp_ai_agents.json")
+        print(f"📁 Usable AI agents (with tools): {len(usable_ai)} → {ai_file}")
 
     # Show sample
     print("\n" + "="*70)
@@ -2546,9 +3238,116 @@ def parse_args():
         action="store_true",
         help="Like --probeable, but also includes Smithery-hosted agents that only need a Smithery API key (no external service credentials).",
     )
+    parser.add_argument(
+        "--setup-auth",
+        action="store_true",
+        help="Run interactive auth setup: check API key env vars, acquire OAuth tokens, and cache credentials for authenticated MCP servers.",
+    )
+    parser.add_argument(
+        "--refilter",
+        action="store_true",
+        help="Skip scraping/probing. Reload mcp_agents.json, fix Smithery tool counts, assign auth_tier, and regenerate mcp_ai_agents.json.",
+    )
     return parser.parse_args()
+
+
+def refilter():
+    """Reload existing data, apply bug fixes and new filter, save mcp_ai_agents.json."""
+    print("=" * 70)
+    print("REFILTER MODE — regenerating mcp_ai_agents.json from existing data")
+    print("=" * 70)
+
+    with open("mcp_agents.json", "r") as f:
+        agents = json.load(f)
+    print(f"\n  Loaded {len(agents)} agents from mcp_agents.json")
+
+    # Fix Smithery 0-tools bug: restore probed_tool_count from tools array
+    smithery_fixed = 0
+    for a in agents:
+        if (a.get('probe_status') in ('skipped', None)
+                and len(a.get('tools', [])) > 0
+                and a.get('probed_tool_count', 0) == 0):
+            a['probe_status'] = 'smithery_tools'
+            a['probed_tool_count'] = len(a['tools'])
+            smithery_fixed += 1
+    print(f"  Smithery bug fix: restored tool counts for {smithery_fixed} agents")
+
+    # Assign auth_tier
+    auth_manager = MCPAuthManager()
+    for a in agents:
+        remotes = a.get('remotes', [])
+        if not remotes:
+            a['auth_tier'] = 'no_remote'
+            continue
+        url = remotes[0].get('url', '')
+        if not url:
+            a['auth_tier'] = 'no_remote'
+            continue
+        parsed = urlparse(url)
+        domain = parsed.hostname or ''
+
+        if a.get('probe_status') == 'success' and not auth_manager.has_auth_for(url):
+            a['auth_tier'] = 'open'
+        elif a.get('probe_status') == 'smithery_tools' or 'server.smithery.ai' in url or 'smithery' in url:
+            a['auth_tier'] = 'smithery_key'
+        elif any(fnmatch(domain + (parsed.path or ''), e['pattern']) or fnmatch(domain, e['pattern'])
+                 for e in _AUTH_KEY_REGISTRY):
+            a['auth_tier'] = 'api_key'
+        elif domain in _PKCE_DOMAINS:
+            a['auth_tier'] = 'oauth'
+        elif domain in _VENDOR_OAUTH_DOMAINS:
+            a['auth_tier'] = 'oauth'
+        elif a.get('probe_status') in ('auth_required', 'not_found', 'unreachable', 'failed'):
+            a['auth_tier'] = 'auth_unknown'
+        else:
+            a['auth_tier'] = 'open'
+
+    # Save full dataset with fixes applied
+    with open("mcp_agents.json", "w") as f:
+        json.dump(agents, f, indent=2)
+    print(f"  Updated mcp_agents.json with auth_tier + tool count fixes")
+
+    # Filter: AI agents with confirmed tools, deduplicated by agent_id
+    seen_ids = set()
+    usable = []
+    for a in agents:
+        if (a.get('agent_classification') == 'ai_agent'
+                and a.get('remotes')
+                and a.get('probed_tool_count', 0) > 0
+                and a.get('agent_id') not in seen_ids):
+            seen_ids.add(a['agent_id'])
+            usable.append(a)
+
+    with open("mcp_ai_agents.json", "w") as f:
+        json.dump(usable, f, indent=2)
+
+    # Summary
+    print(f"\n  mcp_ai_agents.json: {len(usable)} agents (all with confirmed tools)")
+    sources = Counter(a.get('source') for a in usable)
+    for s, c in sources.most_common():
+        print(f"    {s}: {c}")
+    statuses = Counter(a.get('probe_status') for a in usable)
+    print(f"  By probe_status:")
+    for s, c in statuses.most_common():
+        print(f"    {s}: {c}")
+    tiers = Counter(a.get('auth_tier') for a in usable)
+    print(f"  By auth_tier:")
+    for t, c in tiers.most_common():
+        print(f"    {t}: {c}")
+    total_tools = sum(a.get('probed_tool_count', 0) for a in usable)
+    print(f"  Total tools: {total_tools}")
+
+    # Auth tier breakdown for ALL agents
+    all_tiers = Counter(a.get('auth_tier') for a in agents)
+    print(f"\n  Auth tier (all {len(agents)} agents):")
+    for t, c in sorted(all_tiers.items(), key=lambda x: -x[1]):
+        print(f"    {t:20s}: {c}")
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(probeable=args.probeable, smithery=args.smithery)
+    if args.refilter:
+        refilter()
+    else:
+        main(probeable=args.probeable, smithery=args.smithery,
+             setup_auth=args.setup_auth)

@@ -9,3 +9,6 @@ venv
 mcp_agents.json
 mcp_ai_agents.json
 mcp_ai_agents_remote.json
+
+old
+.mcp_tokens.json
